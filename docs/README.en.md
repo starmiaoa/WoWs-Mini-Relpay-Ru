@@ -12,7 +12,7 @@ Inspired by [WoWs-Builder-Team/minimap_renderer](https://github.com/WoWs-Builder
 - **Zero-Setup Desktop App**: Ships as a portable Windows EXE with FFmpeg bundled. Auto-detects both Live and Public Test (PT) installs, supports drag-and-drop batch rendering of `.korablireplay` files, custom resolution/FPS, and opens the timestamped output folder when done.
 - **Multi-Language & Follow-System Theme**: Both the GUI and the rendered video support **English / Русский / 简体中文 / 繁體中文**, defaulting to your OS language (falling back to English for other locales) and OS light/dark theme.
 
-![Render Preview](preview.jpg)
+![Render Preview](preview.gif)
 
 ---
 

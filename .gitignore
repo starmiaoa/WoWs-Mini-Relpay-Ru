@@ -8,6 +8,7 @@ build/
 output/
 *.mp4
 *.gif
+!docs/preview.gif
 data/versions/
 data/gui_settings.json
 AGENT_MAINTENANCE.md
