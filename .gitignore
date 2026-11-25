@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+output/
+*.mp4
+*.gif
+data/versions/
+data/gui_settings.json
+AGENT_MAINTENANCE.md
