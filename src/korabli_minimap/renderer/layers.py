@@ -9,14 +9,21 @@
    并且双方沉没船只自动下沉排序至列表底部、缩进并大幅降低二层底框透明度，一眼区分灭点与阵亡；
 4. 居中保留 820×820 高清小地图（整数 82px 网格、原版双行倒计时、细边框比分条、方/菱形占领点、单层融合烟雾、
    官方空心灭点图标 + 无黑框描边防重叠中文船名）与正下方 860×122 宽幅局内聊天区。
+
+高性能管线说明:
+- 主画布与小地图工作在 RGB 空间（免除每帧全屏 1920×1080 RGBA 拷贝与 RGBA->RGB 转换）；
+- 小地图描边船名、侧边栏船只行卡与面板、占领点、烟雾、主角战报、局内聊天与击杀播报均实施增量脏检查与位图缓存；
+- 烟雾外轮廓采用局部包围盒双半径差值（ImageChops.subtract），彻底消除整图 5×5 MaxFilter 排序滤波瓶颈；
+- 支持 `clone_for_worker()` 零拷贝共享静态底图与预热位图，实现多核线程安全并行渲染。
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from ..config import RenderConfig
 from ..domain.models import (
@@ -145,14 +152,25 @@ def _cover_resize(img: Image.Image, target_w: int, target_h: int) -> Image.Image
     return resized.crop((x0, y0, x0 + target_w, y0 + target_h))
 
 
+def _blit_rgba(dst_rgb: Image.Image, src_rgba: Image.Image, x: int, y: int) -> None:
+    """将 RGBA 贴图按 alpha 混合粘贴到不透明 RGB 目标图（自动裁剪负坐标越界）。"""
+    dw, dh = dst_rgb.size
+    sw, sh = src_rgba.size
+    if x >= dw or y >= dh or x + sw <= 0 or y + sh <= 0:
+        return
+    dst_rgb.paste(src_rgba, (x, y), src_rgba)
+
+
 class MinimapFrameRenderer:
-    """1920×1080 黑色半透明玻璃风 + Tactical-Tech 长条血条 + 局内聊天区 逐帧渲染器。"""
+    """1920×1080 黑色半透明玻璃风 + Tactical-Tech 长条血条 + 局内聊天区 高速逐帧渲染器。"""
 
     def __init__(
         self,
         timeline: BattleTimeline,
         store: VersionDataStore,
         config: RenderConfig | None = None,
+        *,
+        _shared_from: MinimapFrameRenderer | None = None,
     ) -> None:
         self.timeline = timeline
         self.store = store
@@ -160,37 +178,113 @@ class MinimapFrameRenderer:
         self.theme = self.config.theme
         self.lang = normalize_lang(self.config.language)
 
-        # 预缓存本局所有舰船在当前渲染语言下的名称（O(1) 查询，零逐帧开销）
-        self._ship_names_by_vid: dict[int, str] = {
-            vid: store.get_ship_name(m.ship_params_id, lang=self.lang, fallback=m.zh_name)
-            for vid, m in timeline.ships_meta.items()
-        }
-
+        # 每个工作线程独占自己的 FreeType FontManager（FT_Face 非线程安全）
         self.fonts = FontManager(
             version_fonts_dir=store.fonts_dir,
             regular_override=self.config.font_path,
             bold_override=self.config.bold_font_path,
         )
-        self.icons = GameIconFactory(icons_dir=store.icons_dir)
 
-        map_meta = store.get_map_meta(timeline.map_space)
-        self.proj = MapProjection.from_map_meta(map_meta, minimap_size=MINIMAP_SIZE)
+        if _shared_from is not None:
+            # 零拷贝共享不可变静态底图、投影、名单与预热位图，仅隔离线程局部可变缓存
+            self._ship_names_by_vid = _shared_from._ship_names_by_vid
+            self.icons = _shared_from.icons.clone()
+            self.proj = _shared_from.proj
+            self.ally_roster = _shared_from.ally_roster
+            self.enemy_roster = _shared_from.enemy_roster
+            self.base_minimap = _shared_from.base_minimap
+            self.base_canvas = _shared_from.base_canvas
+            self._base_minimap_rgb = _shared_from._base_minimap_rgb
+            self._base_canvas_rgb = _shared_from._base_canvas_rgb
+            self._ally_ear_bg_rgb = _shared_from._ally_ear_bg_rgb
+            self._enemy_ear_bg_rgb = _shared_from._enemy_ear_bg_rgb
+            self._top_hud_bg_rgb = _shared_from._top_hud_bg_rgb
+            self._chat_bg_rgb = _shared_from._chat_bg_rgb
+            self._kill_bg_rgb = _shared_from._kill_bg_rgb
+            self._self_card_base_rgb = _shared_from._self_card_base_rgb
+            self._minimap_label_cache = _shared_from._minimap_label_cache
+            self._ear_row_base_cache: dict[tuple[int, bool, bool, bool], Image.Image] = dict(
+                _shared_from._ear_row_base_cache
+            )
+            self._ear_hdr_cache: dict[tuple[bool, int, int], Image.Image] = {}
+        else:
+            # 预缓存本局所有舰船在当前渲染语言下的名称（O(1) 查询，零逐帧开销）
+            self._ship_names_by_vid = {
+                vid: store.get_ship_name(m.ship_params_id, lang=self.lang, fallback=m.zh_name)
+                for vid, m in timeline.ships_meta.items()
+            }
+            self.icons = GameIconFactory(icons_dir=store.icons_dir)
 
-        self.ally_roster = sorted(
-            [m for m in timeline.ships_meta.values() if m.team_id == timeline.ally_team_id],
-            key=lambda m: (SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name),
+            map_meta = store.get_map_meta(timeline.map_space)
+            self.proj = MapProjection.from_map_meta(map_meta, minimap_size=MINIMAP_SIZE)
+
+            self.ally_roster = sorted(
+                [m for m in timeline.ships_meta.values() if m.team_id == timeline.ally_team_id],
+                key=lambda m: (SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name),
+            )
+            self.enemy_roster = sorted(
+                [m for m in timeline.ships_meta.values() if m.team_id == timeline.enemy_team_id],
+                key=lambda m: (SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name),
+            )
+
+            self.base_minimap = self._build_base_minimap()
+            self.base_canvas = self._build_base_canvas()
+            self._base_minimap_rgb = self.base_minimap.convert("RGB")
+            self._base_canvas_rgb = self.base_canvas.convert("RGB")
+
+            # 预裁剪各独立面板的不透明底图（RGB，避免每帧整画布合成与转换）
+            self._ally_ear_bg_rgb = self._base_canvas_rgb.crop((LEFT_X, EARS_Y, LEFT_X + LEFT_W, EARS_Y + EARS_H))
+            self._enemy_ear_bg_rgb = self._base_canvas_rgb.crop((RIGHT_X, EARS_Y, RIGHT_X + RIGHT_W, EARS_Y + EARS_H))
+            self._top_hud_bg_rgb = self._base_canvas_rgb.crop((CENTER_X, TOP_Y, CENTER_X + CENTER_W, TOP_Y + TOP_H))
+            self._chat_bg_rgb = self._base_canvas_rgb.crop((CENTER_X, CHAT_Y, CENTER_X + CENTER_W, CHAT_Y + CHAT_H))
+            self._kill_bg_rgb = self._base_canvas_rgb.crop((RIGHT_X, KILL_CARD_Y, RIGHT_X + RIGHT_W, KILL_CARD_Y + KILL_CARD_H))
+            self._self_card_base_rgb = self._build_self_stats_base()
+
+            # 预热本局全部 24 艘舰船的小地图描边船名位图（只读，多线程零锁共享）
+            self._minimap_label_cache: dict[tuple[int, bool], tuple[Image.Image, int, int, int, int]] = {}
+            self._prewarm_minimap_labels()
+
+            # 预热本局舰船侧边栏静态行底图与基础 SVG 图标
+            self._ear_row_base_cache = {}
+            self._ear_hdr_cache = {}
+            self._prewarm_ear_rows_and_icons()
+
+        # 线程局部持久主画布缓冲（视频流模式就地增量覆写，免除每帧 6.2MB 整画布拷贝）
+        self._canvas_buf: Image.Image = self._base_canvas_rgb.copy()
+        self._canvas_has_ally_ear_key: Any = None
+        self._canvas_has_enemy_ear_key: Any = None
+        self._canvas_has_self_key: Any = None
+        self._canvas_has_chat_key: Any = None
+        self._canvas_has_kill_key: Any = None
+
+        # 线程局部帧间增量缓存（顺序/分块渲染时命中率 > 90%）
+        self._zones_cache_key: Any = None
+        self._zones_cache_img: Image.Image | None = None
+        self._smoke_cache_key: Any = None
+        self._smoke_cache_val: tuple[int, int, Image.Image] | None = None
+        self._ally_ear_panel: Image.Image = self._ally_ear_bg_rgb.copy()
+        self._ally_ear_hdr_key: Any = None
+        self._ally_ear_row_sigs: list[Any] = [None] * 12
+        self._ally_ear_cache_key: Any = None
+        self._enemy_ear_panel: Image.Image = self._enemy_ear_bg_rgb.copy()
+        self._enemy_ear_hdr_key: Any = None
+        self._enemy_ear_row_sigs: list[Any] = [None] * 12
+        self._enemy_ear_cache_key: Any = None
+        self._self_cache_key: Any = None
+        self._self_cache_img: Image.Image | None = None
+        self._chat_cache_key: Any = None
+        self._chat_cache_img: Image.Image | None = None
+        self._kill_cache_key: Any = None
+        self._kill_cache_img: Image.Image | None = None
+
+    def clone_for_worker(self) -> MinimapFrameRenderer:
+        """克隆供并发工作线程使用的轻量渲染器实例（共享只读静态贴图与预热位图）。"""
+        return MinimapFrameRenderer(
+            timeline=self.timeline,
+            store=self.store,
+            config=self.config,
+            _shared_from=self,
         )
-        self.enemy_roster = sorted(
-            [m for m in timeline.ships_meta.values() if m.team_id == timeline.enemy_team_id],
-            key=lambda m: (SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name),
-        )
-
-        # 预构建烟雾填充与轮廓常驻贴图（避免每帧重复分配 820×820 大图）
-        self._smoke_fill_img = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), self.theme.smoke_fill)
-        self._smoke_rim_img = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), self.theme.smoke_outline)
-
-        self.base_minimap = self._build_base_minimap()
-        self.base_canvas = self._build_base_canvas()
 
     def _t(self, key: str, **kwargs: Any) -> str:
         return tr(self.lang, key, **kwargs)
@@ -226,12 +320,20 @@ class MinimapFrameRenderer:
 
     def sort_roster_for_frame(self, roster: list[ShipMeta], frame: BattleFrame) -> list[ShipMeta]:
         """存活舰船保持原舰种/等级排序置顶，沉没舰船自动下移至列表底部。"""
-        def _key(m: ShipMeta) -> tuple[int, int, int, str]:
-            st = frame.ships.get(m.vehicle_id)
-            alive_rank = 0 if (st is None or st.is_alive) else 1
-            return (alive_rank, SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name)
-
-        return sorted(roster, key=_key)
+        # roster 已按 (SPECIES_ORDER, -level, zh_name) 预排好，仅需线性分区即可保序
+        alive: list[ShipMeta] = []
+        dead: list[ShipMeta] = []
+        ships = frame.ships
+        for m in roster:
+            st = ships.get(m.vehicle_id)
+            if st is None or st.is_alive:
+                alive.append(m)
+            else:
+                dead.append(m)
+        if not dead:
+            return alive
+        alive.extend(dead)
+        return alive
 
     def _build_base_minimap(self) -> Image.Image:
         mdir = self.store.get_map_dir(self.timeline.map_space)
@@ -386,6 +488,125 @@ class MinimapFrameRenderer:
 
         return canvas
 
+    def _build_self_stats_base(self) -> Image.Image:
+        """预烘焙左下主角战报卡片的静态标题、标签、官方图标与分割线。"""
+        base = self._base_canvas_rgb.crop((LEFT_X, SELF_CARD_Y, LEFT_X + LEFT_W, SELF_CARD_Y + SELF_CARD_H))
+        d = ImageDraw.Draw(base, "RGBA")
+        x = 16
+        inner_w = LEFT_W - 32
+        own_meta = self.timeline.ships_meta.get(self.timeline.player_vehicle_id)
+        title = (
+            self._t("hud_self_title_ship", ship=self._ship_name(own_meta))
+            if own_meta
+            else self._t("hud_self_title")
+        )
+        d.text(
+            (x, 16),
+            _truncate_text(d, title, self.fonts.get(15, bold=True), inner_w),
+            font=self.fonts.get(15, bold=True),
+            fill=self.theme.text_primary,
+            anchor="lm",
+        )
+
+        static_rows = [
+            (self._t("hud_dmg_caused"), "caused"),
+            (self._t("hud_dmg_potential"), "blocked"),
+            (self._t("hud_dmg_spotting"), "assisted"),
+            (self._t("hud_kills"), "frag"),
+        ]
+        cy = 108
+        for idx, (label, icon_kind) in enumerate(static_rows):
+            lbl_font = self.fonts.get(17 if idx == 0 else 14, bold=(idx == 0))
+            d.text(
+                (x, cy),
+                label,
+                font=lbl_font,
+                fill=self.theme.text_primary if idx == 0 else self.theme.text_secondary,
+                anchor="lm",
+            )
+            lb = d.textbbox((x, cy), label, font=lbl_font, anchor="lm")
+            ic = (
+                self.icons.get_frag_icon(0, height=17)
+                if icon_kind == "frag"
+                else self.icons.get_damage_counter_icon(icon_kind, size=20 if idx == 0 else 17)
+            )
+            if ic is not None:
+                _blit_rgba(base, ic, lb[2] + 10, round(cy - ic.height / 2))
+            if idx < len(static_rows) - 1:
+                d.line([(x, cy + 19), (x + inner_w, cy + 19)], fill=self.theme.hairline, width=1)
+            cy += 38 if idx == 0 else 34
+
+        return base
+
+    def _prewarm_minimap_labels(self) -> None:
+        """预渲染本局所有舰船在点/灭点描边中文船名位图，消除每帧 FreeType 重复光栅化。"""
+        dummy = ImageDraw.Draw(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+        spotted_font = self.fonts.get(12, bold=True)
+        unspot_font = self.fonts.get(12, bold=False)
+
+        for vid, meta in self.timeline.ships_meta.items():
+            label = self._ship_name(meta)
+            for is_spotted in (True, False):
+                font = spotted_font if is_spotted else unspot_font
+                if is_spotted:
+                    txt_col = self._relation_color(meta.relation)
+                    stroke_col = self.theme.text_stroke
+                else:
+                    txt_col = (
+                        self.theme.unspotted_enemy_text
+                        if meta.relation == RELATION_ENEMY
+                        else self.theme.unspotted_ally_text
+                    )
+                    stroke_col = (4, 6, 9, 225)
+
+                tb = dummy.textbbox((0, 0), label, font=font, stroke_width=2)
+                tw = max(1, tb[2] - tb[0])
+                th = max(1, tb[3] - tb[1])
+                pad = 2
+                sprite = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+                sd = ImageDraw.Draw(sprite)
+                sd.text(
+                    (-tb[0] + pad, -tb[1] + pad),
+                    label,
+                    font=font,
+                    fill=txt_col,
+                    stroke_width=2,
+                    stroke_fill=stroke_col,
+                )
+                # 当绘制在 (lx, ly) 时，sprite 左上角偏移量为 (tb[0] - pad, -pad)
+                self._minimap_label_cache[(vid, is_spotted)] = (sprite, tw, th, tb[0] - pad, -pad)
+
+    def _prewarm_ear_rows_and_icons(self) -> None:
+        """预热常用舰种图标与侧边栏静态基础行贴图，减少并发工作线程冷启动开销。"""
+        for is_ally, roster in ((True, self.ally_roster), (False, self.enemy_roster)):
+            w = LEFT_W if is_ally else RIGHT_W
+            for meta in roster[:12]:
+                # 预热常用状态（存活无灯、存活亮灯；敌方再预热灭点无灯）
+                self._get_ear_row_base(meta, w, is_ally, True, False, False)
+                self._get_ear_row_base(meta, w, is_ally, True, False, True)
+                if not is_ally:
+                    self._get_ear_row_base(meta, w, is_ally, True, True, False)
+                # 预热官方小地图基础舰种图标（仅未旋转 base，避免多线程重复光栅 SVG）
+                is_self = meta.relation == RELATION_SELF
+                self.icons._get_minimap_ship_base(
+                    meta.species,
+                    "self" if is_self else "spotted",
+                    self._relation_color(meta.relation),
+                    24 if is_self else 23,
+                )
+                unsp_col = (
+                    self.theme.unspotted_enemy_icon
+                    if meta.relation == RELATION_ENEMY
+                    else self.theme.unspotted_ally_icon
+                )
+                self.icons._get_minimap_ship_base(meta.species, "unspotted", unsp_col, 23)
+                self.icons._get_minimap_ship_base(
+                    meta.species,
+                    "self_dead" if is_self else "dead",
+                    self.theme.dead_icon,
+                    20,
+                )
+
     def _draw_legend_panel(self, canvas: Image.Image, d: ImageDraw.ImageDraw) -> None:
         x = LEFT_X + 16
         y = LEGEND_Y
@@ -432,17 +653,16 @@ class MinimapFrameRenderer:
             cur_x = tb[2] + 28
 
     # =========================================================================
-    # 主逐帧渲染入口
+    # 主逐帧渲染入口（全 RGB + 持久画布就地增量更新，零全屏拷贝与转换）
     # =========================================================================
 
-    def render_frame(self, frame: BattleFrame, end_banner_alpha: float = 0.0) -> Image.Image:
-        canvas = self.base_canvas.copy()
-        minimap = self.base_minimap.copy()
+    def _render_into_buf(self, frame: BattleFrame, end_banner_alpha: float = 0.0) -> Image.Image:
+        canvas = self._canvas_buf
 
-        # 1. 小地图图层
-        self._draw_capture_zones(minimap, frame)
+        # 1. 小地图图层（带占领点增量缓存的 RGB 基底）
+        minimap = self._get_minimap_with_zones(frame)
         if self.config.show_smoke and frame.smokes:
-            minimap = self._composite_smokes(minimap, frame)
+            self._composite_smokes(minimap, frame)
         if self.config.show_consumable_rings:
             self._draw_consumable_rings(minimap, frame)
         if self.config.show_dead_markers:
@@ -452,37 +672,66 @@ class MinimapFrameRenderer:
         if self.config.show_torpedoes and frame.torpedoes:
             self._draw_torpedoes(minimap, frame)
         self._draw_live_ships_and_labels(minimap, frame)
-        if self.config.show_planes and frame.planes:
+        if self.config.show_planes and (frame.planes or frame.fighter_wards):
             self._draw_planes(minimap, frame)
 
         if end_banner_alpha > 0.01:
-            minimap = self._composite_end_banner(minimap, frame, end_banner_alpha)
+            self._composite_end_banner(minimap, frame, end_banner_alpha)
 
         canvas.paste(minimap, (MINIMAP_X, MINIMAP_Y))
 
-        # 2. 顶部原版计分与双行倒计时
-        draw = ImageDraw.Draw(canvas)
+        # 2. 顶部原版计分与双行倒计时（仅重置 860×60 顶部 HUD 区域）
+        canvas.paste(self._top_hud_bg_rgb, (CENTER_X, TOP_Y))
+        draw = ImageDraw.Draw(canvas, "RGBA")
         self._draw_top_hud(draw, frame)
 
-        # 3. 左右 Tactical-Tech 舰队面板（整格团队总血条 + 沉没自动下移排序 + 低透明度阵亡行）
+        # 3. 左右 Tactical-Tech 舰队面板（逐行槽位脏检查 + 仅脏区重绘）
         self._draw_tactical_ears(canvas, frame, self.ally_roster, x=LEFT_X, w=LEFT_W, is_ally=True)
         self._draw_tactical_ears(canvas, frame, self.enemy_roster, x=RIGHT_X, w=RIGHT_W, is_ally=False)
 
-        # 4. 左下主角战报 + 中下局内聊天 + 右下官方击杀播报
-        self._draw_self_stats_widget(canvas, draw, frame)
+        # 4. 左下主角战报 + 中下局内聊天 + 右下官方击杀播报（脏检查：无变化时直接跳过贴图）
+        self._draw_self_stats_widget(canvas, frame)
         if self.config.show_chat:
-            self._draw_chat_panel(draw, frame)
-        self._draw_kill_feed(canvas, draw, frame)
+            self._draw_chat_panel(canvas, frame)
+        self._draw_kill_feed(canvas, frame)
 
-        return canvas.convert("RGB")
+        return canvas
+
+    def render_frame(self, frame: BattleFrame, end_banner_alpha: float = 0.0) -> Image.Image:
+        """渲染单帧并返回独立安全的 RGB PIL Image 副本。"""
+        return self._render_into_buf(frame, end_banner_alpha=end_banner_alpha).copy()
+
+    def render_frame_rgb_array(
+        self, frame: BattleFrame, end_banner_alpha: float = 0.0
+    ) -> np.ndarray:
+        """高速视频流接口：就地增量更新持久画布，直接以连续 uint8 NumPy 数组返回 RGB24 帧（零多余拷贝）。"""
+        buf = self._render_into_buf(frame, end_banner_alpha=end_banner_alpha)
+        return np.array(buf, dtype=np.uint8, copy=True)
 
     # =========================================================================
     # 小地图各图层
     # =========================================================================
 
-    def _draw_capture_zones(self, minimap: Image.Image, frame: BattleFrame) -> None:
+    def _get_minimap_with_zones(self, frame: BattleFrame) -> Image.Image:
         if not frame.capture_zones:
-            return
+            return self._base_minimap_rgb.copy()
+
+        zkey = tuple(
+            (
+                z.label,
+                round(z.x, 1),
+                round(z.z, 1),
+                round(z.radius_bw, 1),
+                z.owner_team,
+                z.invader_team,
+                round(z.progress, 3),
+                z.is_contested,
+            )
+            for z in frame.capture_zones
+        )
+        if zkey == self._zones_cache_key and self._zones_cache_img is not None:
+            return self._zones_cache_img.copy()
+
         overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
         d = ImageDraw.Draw(overlay)
         label_font = self.fonts.get(18, bold=True)
@@ -517,35 +766,78 @@ class MinimapFrameRenderer:
                 d.rectangle([px - hs, py - hs, px + hs, py + hs], fill=(10, 12, 16, 150), outline=border_col, width=2)
                 d.text((px, py), z.label, font=label_font, fill=border_col, anchor="mm")
 
-        minimap.alpha_composite(overlay)
+        cached = self._base_minimap_rgb.copy()
+        cached.paste(overlay, (0, 0), overlay)
+        self._zones_cache_key = zkey
+        self._zones_cache_img = cached
+        return cached.copy()
 
-    def _composite_smokes(self, minimap: Image.Image, frame: BattleFrame) -> Image.Image:
-        mask = Image.new("L", (MINIMAP_SIZE, MINIMAP_SIZE), 0)
-        md = ImageDraw.Draw(mask)
-        has_any = False
+    def _composite_smokes(self, minimap: Image.Image, frame: BattleFrame) -> None:
+        smoke_key = tuple((sm.entity_id, round(sm.radius_bw, 2), sm.points) for sm in frame.smokes)
+        if smoke_key == self._smoke_cache_key:
+            if self._smoke_cache_val is not None:
+                bx0, by0, smoke_rgba = self._smoke_cache_val
+                minimap.paste(smoke_rgba, (bx0, by0), smoke_rgba)
+            return
+
+        circles: list[tuple[float, float, float]] = []
+        min_x = float(MINIMAP_SIZE)
+        min_y = float(MINIMAP_SIZE)
+        max_x = 0.0
+        max_y = 0.0
 
         for sm in frame.smokes:
             r = max(6.5, self.proj.radius_bw_to_pixel(sm.radius_bw))
             for wx, wz in sm.points:
                 px, py = self.proj.world_to_pixel(wx, wz)
-                if -r <= px <= MINIMAP_SIZE + r and -r <= py <= MINIMAP_SIZE + r:
-                    md.ellipse([px - r, py - r, px + r, py + r], fill=255)
-                    has_any = True
+                if -r - 3 <= px <= MINIMAP_SIZE + r + 3 and -r - 3 <= py <= MINIMAP_SIZE + r + 3:
+                    circles.append((px, py, r))
+                    if px - r < min_x:
+                        min_x = px - r
+                    if py - r < min_y:
+                        min_y = py - r
+                    if px + r > max_x:
+                        max_x = px + r
+                    if py + r > max_y:
+                        max_y = py + r
 
-        if not has_any:
-            return minimap
+        if not circles:
+            self._smoke_cache_key = smoke_key
+            self._smoke_cache_val = None
+            return
 
-        dilated = mask.filter(ImageFilter.MaxFilter(5))
-        smoke_layer = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
-        smoke_layer.paste(self._smoke_fill_img, (0, 0), mask)
+        # 仅在紧凑包围盒内绘制双半径圆并用 C 级 ImageChops.subtract 求 2px 融合轮廓（比 MaxFilter(5) 快 ~80 倍）
+        pad = 4
+        bx0 = max(0, int(math.floor(min_x)) - pad)
+        by0 = max(0, int(math.floor(min_y)) - pad)
+        bx1 = min(MINIMAP_SIZE, int(math.ceil(max_x)) + pad)
+        by1 = min(MINIMAP_SIZE, int(math.ceil(max_y)) + pad)
+        bw = bx1 - bx0
+        bh = by1 - by0
+        if bw <= 0 or bh <= 0:
+            self._smoke_cache_key = smoke_key
+            self._smoke_cache_val = None
+            return
 
-        m_arr = np.asarray(mask, dtype=np.uint8)
-        d_arr = np.asarray(dilated, dtype=np.uint8)
-        rim_arr = np.where((d_arr > 0) & (m_arr == 0), 255, 0).astype(np.uint8)
-        rim_mask = Image.fromarray(rim_arr, mode="L")
-        smoke_layer.paste(self._smoke_rim_img, (0, 0), rim_mask)
+        inner = Image.new("L", (bw, bh), 0)
+        outer = Image.new("L", (bw, bh), 0)
+        idraw = ImageDraw.Draw(inner)
+        odraw = ImageDraw.Draw(outer)
+        for px, py, r in circles:
+            lx = px - bx0
+            ly = py - by0
+            idraw.ellipse([lx - r, ly - r, lx + r, ly + r], fill=255)
+            ro = r + 2.0
+            odraw.ellipse([lx - ro, ly - ro, lx + ro, ly + ro], fill=255)
 
-        return Image.alpha_composite(minimap, smoke_layer)
+        rim = ImageChops.subtract(outer, inner)
+        smoke_rgba = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        smoke_rgba.paste(self.theme.smoke_fill, (0, 0), inner)
+        smoke_rgba.paste(self.theme.smoke_outline, (0, 0), rim)
+
+        self._smoke_cache_key = smoke_key
+        self._smoke_cache_val = (bx0, by0, smoke_rgba)
+        minimap.paste(smoke_rgba, (bx0, by0), smoke_rgba)
 
     def _draw_consumable_rings(self, minimap: Image.Image, frame: BattleFrame) -> None:
         rings: list[tuple[float, float, float, tuple[int, int, int, int]]] = []
@@ -561,17 +853,16 @@ class MinimapFrameRenderer:
                 rings.append((px, py, r, col))
         if not rings:
             return
-        overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(overlay)
+        d = ImageDraw.Draw(minimap, "RGBA")
         for px, py, r, col in rings:
             d.ellipse([px - r, py - r, px + r, py + r], outline=col, width=2)
-        minimap.alpha_composite(overlay)
 
     def _draw_dead_ships(self, minimap: Image.Image, frame: BattleFrame) -> None:
+        ships_meta = self.timeline.ships_meta
         for vid, st in frame.ships.items():
             if st.is_alive or not st.has_been_spotted:
                 continue
-            meta = self.timeline.ships_meta.get(vid)
+            meta = ships_meta.get(vid)
             if meta is None:
                 continue
             px, py = self.proj.world_to_pixel(st.x, st.z)
@@ -583,48 +874,83 @@ class MinimapFrameRenderer:
                 state=dead_state,
                 height=20,
             )
-            minimap.alpha_composite(icon, (round(px - icon.width / 2), round(py - icon.height / 2)))
+            _blit_rgba(minimap, icon, round(px - icon.width / 2), round(py - icon.height / 2))
 
     def _draw_shells(self, minimap: Image.Image, frame: BattleFrame) -> None:
-        overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(overlay)
+        d = ImageDraw.Draw(minimap, "RGBA")
+        ap_col = self.theme.shell_ap
+        cs_col = self.theme.shell_cs
+        he_col = self.theme.shell_he
+        sec_a = self.theme.shell_secondary_alpha
         for sh in frame.shells:
             x0, y0 = self.proj.world_to_pixel(sh.x0, sh.z0)
             x1, y1 = self.proj.world_to_pixel(sh.x1, sh.z1)
             if sh.ammo_type == "AP":
-                base_col = self.theme.shell_ap
+                base_col = ap_col
             elif sh.ammo_type == "CS":
-                base_col = self.theme.shell_cs
+                base_col = cs_col
             else:
-                base_col = self.theme.shell_he
-            col = (
-                base_col[0],
-                base_col[1],
-                base_col[2],
-                self.theme.shell_secondary_alpha if sh.is_secondary else base_col[3],
-            )
+                base_col = he_col
+            col = (base_col[0], base_col[1], base_col[2], sec_a if sh.is_secondary else base_col[3])
             d.line([(x0, y0), (x1, y1)], fill=col, width=1 if sh.is_secondary else 2)
-        minimap.alpha_composite(overlay)
 
     def _draw_torpedoes(self, minimap: Image.Image, frame: BattleFrame) -> None:
-        overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(overlay)
+        d = ImageDraw.Draw(minimap, "RGBA")
         for t in frame.torpedoes:
             px, py = self.proj.world_to_pixel(t.x, t.z)
             if not (0 <= px <= MINIMAP_SIZE and 0 <= py <= MINIMAP_SIZE):
                 continue
             col = self._relation_color(t.relation)
             d.ellipse([px - 2.8, py - 2.8, px + 2.8, py + 2.8], fill=col)
-        minimap.alpha_composite(overlay)
+
+    def _get_minimap_label_sprite(
+        self, meta: ShipMeta, is_spotted: bool
+    ) -> tuple[Image.Image, int, int, int, int]:
+        key = (meta.vehicle_id, is_spotted)
+        cached = self._minimap_label_cache.get(key)
+        if cached is not None:
+            return cached
+
+        font = self.fonts.get(12, bold=is_spotted)
+        label = self._ship_name(meta)
+        if is_spotted:
+            txt_col = self._relation_color(meta.relation)
+            stroke_col = self.theme.text_stroke
+        else:
+            txt_col = (
+                self.theme.unspotted_enemy_text
+                if meta.relation == RELATION_ENEMY
+                else self.theme.unspotted_ally_text
+            )
+            stroke_col = (4, 6, 9, 225)
+
+        dummy = ImageDraw.Draw(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+        tb = dummy.textbbox((0, 0), label, font=font, stroke_width=2)
+        tw = max(1, tb[2] - tb[0])
+        th = max(1, tb[3] - tb[1])
+        pad = 2
+        sprite = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(sprite).text(
+            (-tb[0] + pad, -tb[1] + pad),
+            label,
+            font=font,
+            fill=txt_col,
+            stroke_width=2,
+            stroke_fill=stroke_col,
+        )
+        res = (sprite, tw, th, tb[0] - pad, -pad)
+        self._minimap_label_cache[key] = res
+        return res
 
     def _draw_live_ships_and_labels(self, minimap: Image.Image, frame: BattleFrame) -> None:
         unspotted_ships: list[tuple[ShipMeta, ShipState]] = []
         spotted_ships: list[tuple[ShipMeta, ShipState]] = []
+        ships_meta = self.timeline.ships_meta
 
         for vid, st in frame.ships.items():
             if not st.is_alive or not st.has_been_spotted:
                 continue
-            meta = self.timeline.ships_meta.get(vid)
+            meta = ships_meta.get(vid)
             if meta is None:
                 continue
             if st.is_spotted:
@@ -634,11 +960,7 @@ class MinimapFrameRenderer:
 
         spotted_ships.sort(key=lambda pair: (1 if pair[0].relation == RELATION_SELF else 0, pair[0].vehicle_id))
 
-        overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(overlay)
-        spotted_font = self.fonts.get(12, bold=True)
-        unspot_font = self.fonts.get(12, bold=False)
-
+        d = ImageDraw.Draw(minimap, "RGBA")
         label_requests: list[tuple[int, ShipMeta, ShipState, float, float, bool]] = []
 
         # 1. 灭点舰船（俄服官方空心 *_last_visible.svg）
@@ -656,7 +978,7 @@ class MinimapFrameRenderer:
                 state="unspotted",
                 height=23,
             )
-            minimap.alpha_composite(icon, (round(px - icon.width / 2), round(py - icon.height / 2)))
+            _blit_rgba(minimap, icon, round(px - icon.width / 2), round(py - icon.height / 2))
             if self.config.show_unspotted_names:
                 label_requests.append((2, meta, st, px, py, False))
 
@@ -672,7 +994,7 @@ class MinimapFrameRenderer:
                 state="self" if is_self else "spotted",
                 height=24 if is_self else 23,
             )
-            minimap.alpha_composite(icon, (round(px - icon.width / 2), round(py - icon.height / 2)))
+            _blit_rgba(minimap, icon, round(px - icon.width / 2), round(py - icon.height / 2))
 
             has_bar = self.config.show_mini_hp_bars and st.max_hp > 0 and (st.in_aoi or is_self)
             if has_bar:
@@ -695,7 +1017,7 @@ class MinimapFrameRenderer:
                 prio = 0 if is_self else (1 if meta.relation == RELATION_ENEMY else 3)
                 label_requests.append((prio, meta, st, px, py, True))
 
-        # 3. 无黑框细描边中文船名 + 防重叠
+        # 3. 预缓存无黑框细描边中文船名 + 防重叠（零 FreeType 逐帧开销）
         label_requests.sort(key=lambda item: (item[0], item[4], item[3]))
         placed_boxes: list[tuple[float, float, float, float]] = []
 
@@ -707,15 +1029,11 @@ class MinimapFrameRenderer:
             return False
 
         for _prio, meta, st, px, py, is_spotted in label_requests:
-            font = spotted_font if is_spotted else unspot_font
-            label = self._ship_name(meta)
-            tb = d.textbbox((0, 0), label, font=font, stroke_width=2)
-            tw = tb[2] - tb[0]
-            th = tb[3] - tb[1]
+            sprite, tw, th, dx, dy = self._get_minimap_label_sprite(meta, is_spotted)
 
             has_bar = is_spotted and self.config.show_mini_hp_bars and st.max_hp > 0 and (st.in_aoi or meta.relation == RELATION_SELF)
             base_down = 19 if has_bar else 14
-            candidates = [
+            candidates = (
                 (px - tw * 0.5, py + base_down),
                 (px - tw * 0.5, py - 14 - th),
                 (px + 15, py - th * 0.5),
@@ -726,7 +1044,7 @@ class MinimapFrameRenderer:
                 (px - 12 - tw, py - 14 - th),
                 (px - tw * 0.5, py + base_down + th + 3),
                 (px - tw * 0.5, py - 17 - th * 2),
-            ]
+            )
 
             chosen = None
             for cx0, cy0 in candidates:
@@ -745,40 +1063,45 @@ class MinimapFrameRenderer:
                 placed_boxes.append((cx0, cy0, cx0 + tw, cy0 + th))
 
             lx, ly = round(chosen[0]), round(chosen[1])
-            if is_spotted:
-                txt_col = self._relation_color(meta.relation)
-                stroke_col = self.theme.text_stroke
-            else:
-                txt_col = (
-                    self.theme.unspotted_enemy_text
-                    if meta.relation == RELATION_ENEMY
-                    else self.theme.unspotted_ally_text
-                )
-                stroke_col = (4, 6, 9, 225)
-
-            d.text(
-                (lx, ly - tb[1]),
-                label,
-                font=font,
-                fill=txt_col,
-                stroke_width=2,
-                stroke_fill=stroke_col,
-            )
-
-        minimap.alpha_composite(overlay)
+            _blit_rgba(minimap, sprite, lx + dx, ly + dy)
 
     def _draw_planes(self, minimap: Image.Image, frame: BattleFrame) -> None:
-        for p in frame.planes:
+        # 1. 巡逻战斗机圆形防空拦截圈（对应官方 ward_fighters_marker.unbound，淡透明阵营色圆）
+        if frame.fighter_wards:
+            d = ImageDraw.Draw(minimap, "RGBA")
+            for w in frame.fighter_wards:
+                px, py = self.proj.world_to_pixel(w.x, w.z)
+                r = max(8.0, self.proj.radius_bw_to_pixel(w.radius_bw))
+                if not (-r <= px <= MINIMAP_SIZE + r and -r <= py <= MINIMAP_SIZE + r):
+                    continue
+                col = self._relation_color(w.relation)
+                d.ellipse(
+                    [px - r, py - r, px + r, py + r],
+                    fill=(col[0], col[1], col[2], 24),
+                    outline=(col[0], col[1], col[2], 120),
+                    width=1,
+                )
+
+        # 2. 官方原版飞机/战斗机/水侦/空袭图标（消耗品机先画，航母攻击编队置顶，0° 垂直清晰显示）
+        ordered = sorted(frame.planes, key=lambda p: (0 if p.is_consumable else 1, p.plane_id))
+        for p in ordered:
             px, py = self.proj.world_to_pixel(p.x, p.z)
             if not (-20 <= px <= MINIMAP_SIZE + 20 and -20 <= py <= MINIMAP_SIZE + 20):
                 continue
             col = self._relation_color(p.relation)
-            icon = self.icons.get_plane_icon(col, p.yaw_rad, returning=(p.purpose == 1), size=18)
-            minimap.alpha_composite(icon, (round(px - icon.width / 2), round(py - icon.height / 2)))
+            icon = self.icons.get_plane_icon(
+                color=col,
+                yaw_rad=p.yaw_rad,
+                returning=(p.purpose == 1),
+                size=20,
+                icon_name=p.icon_name,
+                rotate=False,
+            )
+            _blit_rgba(minimap, icon, round(px - icon.width / 2), round(py - icon.height / 2))
 
     def _composite_end_banner(
         self, minimap: Image.Image, frame: BattleFrame, alpha_scale: float
-    ) -> Image.Image:
+    ) -> None:
         overlay = Image.new("RGBA", (MINIMAP_SIZE, MINIMAP_SIZE), (0, 0, 0, 0))
         d = ImageDraw.Draw(overlay)
         a = max(0.0, min(1.0, alpha_scale))
@@ -814,7 +1137,7 @@ class MinimapFrameRenderer:
             fill=(accent[0], accent[1], accent[2], int(245 * a)),
             anchor="mm",
         )
-        return Image.alpha_composite(minimap, overlay)
+        minimap.paste(overlay, (0, 0), overlay)
 
     # =========================================================================
     # 顶部 HUD（原版双行倒计时 + 细边框双向比分条 + 双行 TTW）
@@ -866,40 +1189,29 @@ class MinimapFrameRenderer:
         d.text((ttw_x, TOP_Y + 41), _fmt_mmss(frame.enemy_ttw_sec), font=ttw_font, fill=self.theme.enemy_color, anchor="lm")
 
     # =========================================================================
-    # 左右 Tactical-Tech 舰队面板
-    # - 顶栏整格恒定绿/红团队总血条（带存活人数 + 总血量）
-    # - 沉没船只自动下移至底部、缩进并极低二层透明度，一眼区分灭点与阵亡
-    # - 单船连续长条 100-70 绿 / 70-30 黄 / 30-0 红血条，无行内击杀角标
+    # 左右 Tactical-Tech 舰队面板（单行位图缓存 + 整栏脏检查）
     # =========================================================================
 
-    def _draw_tactical_ears(
+    def _get_ear_header_rgba(
         self,
-        canvas: Image.Image,
-        frame: BattleFrame,
-        roster: list[ShipMeta],
-        x: int,
         w: int,
         is_ally: bool,
-    ) -> None:
+        alive_cnt: int,
+        total_cnt: int,
+        cur_total_hp: int,
+        max_total_hp: int,
+    ) -> Image.Image:
+        key = (is_ally, alive_cnt, cur_total_hp)
+        cached = self._ear_hdr_cache.get(key)
+        if cached is not None:
+            return cached
+
         hdr_font = self.fonts.get(15, bold=True)
         tot_font = self.fonts.get(15, bold=True)
-        nick_font = self.fonts.get(14, bold=True)
-        ship_font = self.fonts.get(13, bold=False)
+        hdr = Image.new("RGBA", (w, EARS_HEADER_H + 1), (0, 0, 0, 0))
+        rd = ImageDraw.Draw(hdr)
 
-        # 局部 RGBA 面板图层（仅 498×596，比全画布合成快 ~7 倍）
-        ear_layer = Image.new("RGBA", (w, EARS_H), (0, 0, 0, 0))
-        rd = ImageDraw.Draw(ear_layer)
-
-        alive_cnt = sum(1 for m in roster if m.vehicle_id in frame.ships and frame.ships[m.vehicle_id].is_alive)
-        cur_total_hp = sum(
-            max(0, frame.ships[m.vehicle_id].hp)
-            for m in roster
-            if m.vehicle_id in frame.ships and frame.ships[m.vehicle_id].is_alive
-        )
-        max_total_hp = max(1, sum(m.max_hp for m in roster))
-        tot_ratio = max(0.0, min(1.0, cur_total_hp / max_total_hp))
-
-        # 1. 顶部整格恒定绿色/红色团队总血量进度条（参考游戏内全高团队血条，不随百分比变色）
+        tot_ratio = max(0.0, min(1.0, cur_total_hp / max(1, max_total_hp)))
         hdr_x0, hdr_y0 = 1, 1
         hdr_x1, hdr_y1 = w - 1, EARS_HEADER_H
         hdr_span = hdr_x1 - hdr_x0
@@ -921,247 +1233,355 @@ class MinimapFrameRenderer:
 
         rd.line([(hdr_x0, hdr_y1), (hdr_x1, hdr_y1)], fill=self.theme.hairline, width=1)
 
-        # 团队标题（含人数）+ 总血量，带微描边确保在绿/红底与暗底上都清晰锐利
         hdr_cy = (hdr_y0 + hdr_y1) // 2
         txt_stroke = (6, 8, 12, 205)
         hp_txt = self._t("hud_total_hp", hp=_fmt_num(cur_total_hp))
         if is_ally:
-            title = f"{self._t('hud_allies')}  {alive_cnt}/{len(roster)}"
+            title = f"{self._t('hud_allies')}  {alive_cnt}/{total_cnt}"
             rd.text((14, hdr_cy), title, font=hdr_font, fill=self.theme.text_primary, anchor="lm", stroke_width=1, stroke_fill=txt_stroke)
             rd.text((w - 14, hdr_cy), hp_txt, font=tot_font, fill=self.theme.text_primary, anchor="rm", stroke_width=1, stroke_fill=txt_stroke)
         else:
-            title = f"{self._t('hud_enemies')}  {alive_cnt}/{len(roster)}"
+            title = f"{self._t('hud_enemies')}  {alive_cnt}/{total_cnt}"
             rd.text((14, hdr_cy), hp_txt, font=tot_font, fill=self.theme.text_primary, anchor="lm", stroke_width=1, stroke_fill=txt_stroke)
             rd.text((w - 14, hdr_cy), title, font=hdr_font, fill=self.theme.text_primary, anchor="rm", stroke_width=1, stroke_fill=txt_stroke)
 
-        # 2. 存活置顶、沉没自动下移排序（敌我双方一致）
-        ordered_roster = self.sort_roster_for_frame(roster, frame)
+        # 限制缓存体积避免长局无限增长
+        if len(self._ear_hdr_cache) > 64:
+            self._ear_hdr_cache.clear()
+        self._ear_hdr_cache[key] = hdr
+        return hdr
+
+    def _get_ear_row_base(
+        self,
+        meta: ShipMeta,
+        w: int,
+        is_ally: bool,
+        is_alive: bool,
+        is_unspotted_enemy: bool,
+        lamp_on: bool,
+    ) -> Image.Image:
+        """缓存单船行底图（含 5px 侧边条、舰种图标、点亮灯、截断玩家名与船名、血条底槽）。"""
+        key = (meta.vehicle_id, is_alive, is_unspotted_enemy, lamp_on if is_alive else False)
+        cached = self._ear_row_base_cache.get(key)
+        if cached is not None:
+            return cached
 
         row_pad_x = 8
         full_row_w = w - row_pad_x * 2      # 482px
-        dead_row_w = full_row_w - 136       # 346px（阵亡行贴外侧缩进）
+        dead_row_w = full_row_w - 136       # 346px
         hp_bar_w = 132
         hp_bar_h = 13
-        row_start_y = EARS_HEADER_H + 6     # 局部坐标 y=42
+        row_w = full_row_w if is_alive else dead_row_w
 
-        for idx, meta in enumerate(ordered_roster[:12]):
-            ry = row_start_y + idx * (EARS_ROW_H + EARS_ROW_GAP)
-            st = frame.ships.get(meta.vehicle_id)
+        row_rgba = Image.new("RGBA", (row_w + 1, EARS_ROW_H + 1), (0, 0, 0, 0))
+        rd = ImageDraw.Draw(row_rgba)
+
+        if not is_alive:
+            row_fill = self.theme.glass_row_dead
+            row_border = (255, 255, 255, 16)
+        elif meta.relation == RELATION_SELF:
+            row_fill = self.theme.glass_row_self
+            row_border = self.theme.accent_gold
+        elif is_unspotted_enemy:
+            row_fill = self.theme.glass_row_unspotted
+            row_border = (255, 255, 255, 26)
+        else:
+            row_fill = self.theme.glass_row
+            row_border = (255, 255, 255, 30)
+
+        rd.rectangle([0, 0, row_w, EARS_ROW_H], fill=row_fill, outline=row_border, width=1)
+
+        if not is_alive:
+            edge_col = (70, 74, 82, 95)
+        elif meta.relation == RELATION_SELF:
+            edge_col = self.theme.self_color
+        elif meta.relation == RELATION_DIVISION:
+            edge_col = self.theme.division_color
+        elif is_ally:
+            edge_col = self.theme.ally_color
+        else:
+            edge_col = self.theme.enemy_color if not is_unspotted_enemy else (196, 78, 76, 215)
+
+        if is_ally:
+            rd.rectangle([0, 0, 5, EARS_ROW_H], fill=edge_col)
+        else:
+            rd.rectangle([row_w - 5, 0, row_w, EARS_ROW_H], fill=edge_col)
+
+        if not is_alive:
+            icon_col = self.theme.dead_icon
+            nick_col = self.theme.dead_text
+            ship_col = (98, 104, 114, 140)
+        elif meta.relation in (RELATION_SELF, RELATION_DIVISION):
+            icon_col = self.theme.division_color if meta.relation == RELATION_DIVISION else self.theme.self_color
+            nick_col = self.theme.division_color
+            ship_col = self.theme.text_ship_sub
+        elif is_ally or not is_unspotted_enemy:
+            icon_col = (244, 246, 250, 248)
+            nick_col = self.theme.text_primary
+            ship_col = self.theme.text_ship_sub
+        else:
+            icon_col = (196, 202, 212, 220)
+            nick_col = (210, 216, 224, 238)
+            ship_col = (168, 176, 188, 226)
+
+        cls_icon = self.icons.get_hud_class_icon(
+            species=meta.species,
+            color=icon_col,
+            size=26,
+            flip_left=(not is_ally),
+        )
+
+        nick_font = self.fonts.get(14, bold=True)
+        ship_font = self.fonts.get(13, bold=False)
+        full_nick = f"[{meta.clan_tag}]{meta.player_name}" if meta.clan_tag else meta.player_name
+        tier_txt = ROMAN_TIERS.get(meta.level, str(meta.level))
+        ship_disp = self._ship_name(meta)
+        ship_sub = f"{tier_txt} {ship_disp}" if is_ally else f"{ship_disp} {tier_txt}"
+
+        if is_ally:
+            row_rgba.alpha_composite(cls_icon, (10, (EARS_ROW_H - 26) // 2))
+            text_left = 42
+            text_right = (row_w - hp_bar_w - 18) if is_alive else (row_w - 12)
+
+            nick_x = text_left
+            if is_alive:
+                ly_c = 13
+                if lamp_on:
+                    rd.ellipse([nick_x - 3, ly_c - 6, nick_x + 9, ly_c + 6], fill=self.theme.spot_lamp_glow)
+                    rd.ellipse([nick_x, ly_c - 3, nick_x + 6, ly_c + 3], fill=self.theme.spot_lamp_on)
+                else:
+                    rd.ellipse([nick_x, ly_c - 3, nick_x + 6, ly_c + 3], fill=self.theme.spot_lamp_off)
+                nick_x += 13
+            rd.text(
+                (nick_x, 5),
+                _truncate_text(rd, full_nick, nick_font, max(24, text_right - nick_x)),
+                font=nick_font,
+                fill=nick_col,
+            )
+            rd.text(
+                (text_left, 23),
+                _truncate_text(rd, ship_sub, ship_font, max(24, text_right - text_left)),
+                font=ship_font,
+                fill=ship_col,
+            )
+
+            if is_alive:
+                bx1 = row_w - 10
+                bx0 = bx1 - hp_bar_w
+                by0 = (EARS_ROW_H - hp_bar_h) // 2
+                by1 = by0 + hp_bar_h
+                rd.rectangle([bx0, by0, bx1, by1], fill=self.theme.hp_track, outline=self.theme.hp_border, width=1)
+        else:
+            row_rgba.alpha_composite(cls_icon, (row_w - 10 - 26, (EARS_ROW_H - 26) // 2))
+            text_right = row_w - 42
+            text_left = (hp_bar_w + 18) if is_alive else 12
+
+            nick_r = text_right
+            if is_alive:
+                ly_c = 13
+                lx = nick_r - 6
+                if lamp_on:
+                    rd.ellipse([lx - 3, ly_c - 6, lx + 9, ly_c + 6], fill=self.theme.spot_lamp_glow)
+                    rd.ellipse([lx, ly_c - 3, lx + 6, ly_c + 3], fill=self.theme.spot_lamp_on)
+                else:
+                    rd.ellipse([lx, ly_c - 3, lx + 6, ly_c + 3], fill=self.theme.spot_lamp_off)
+                nick_r -= 13
+            rd.text(
+                (nick_r, 5),
+                _truncate_text(rd, full_nick, nick_font, max(24, nick_r - text_left)),
+                font=nick_font,
+                fill=nick_col,
+                anchor="ra",
+            )
+            rd.text(
+                (text_right, 23),
+                _truncate_text(rd, ship_sub, ship_font, max(24, text_right - text_left)),
+                font=ship_font,
+                fill=ship_col,
+                anchor="ra",
+            )
+
+            if is_alive:
+                bx0 = 10
+                bx1 = bx0 + hp_bar_w
+                by0 = (EARS_ROW_H - hp_bar_h) // 2
+                by1 = by0 + hp_bar_h
+                rd.rectangle([bx0, by0, bx1, by1], fill=self.theme.hp_track, outline=self.theme.hp_border, width=1)
+
+        self._ear_row_base_cache[key] = row_rgba
+        return row_rgba
+
+    def _draw_tactical_ears(
+        self,
+        canvas: Image.Image,
+        frame: BattleFrame,
+        roster: list[ShipMeta],
+        x: int,
+        w: int,
+        is_ally: bool,
+    ) -> None:
+        ships = frame.ships
+        alive_cnt = 0
+        cur_total_hp = 0
+        max_total_hp = 0
+        for m in roster:
+            max_total_hp += m.max_hp
+            st = ships.get(m.vehicle_id)
+            if st is not None and st.is_alive:
+                alive_cnt += 1
+                if st.hp > 0:
+                    cur_total_hp += st.hp
+        max_total_hp = max(1, max_total_hp)
+
+        ordered_roster = self.sort_roster_for_frame(roster, frame)
+        hp_bar_w = 132
+        hp_bar_h = 13
+
+        row_specs: list[tuple[ShipMeta, bool, bool, bool, int, tuple[int, int, int, int]]] = []
+        sig_rows: list[tuple[int, bool, bool, bool, int, tuple[int, int, int, int]]] = []
+        for meta in ordered_roster[:12]:
+            st = ships.get(meta.vehicle_id)
             is_alive = st.is_alive if st else True
             is_spotted = bool(st and st.is_spotted)
             is_unspotted_enemy = is_alive and (not is_ally) and (not is_spotted)
-            hp = st.hp if st else meta.max_hp
-            max_hp = (st.max_hp if st and st.max_hp > 0 else meta.max_hp) or 1
-            ratio = max(0.0, min(1.0, hp / max_hp)) if is_alive else 0.0
+            lamp_on = bool(st and (st.is_detected_by_enemy if is_ally else st.is_spotted)) if is_alive else False
+            if is_alive:
+                hp = st.hp if st else meta.max_hp
+                max_hp = (st.max_hp if st and st.max_hp > 0 else meta.max_hp) or 1
+                ratio = max(0.0, min(1.0, hp / max_hp))
+                fw = max(2, round((hp_bar_w - 2) * ratio)) if ratio > 0 else 0
+                hp_col = self.hp_threshold_color(ratio)
+            else:
+                fw = 0
+                hp_col = self.theme.hp_red
+            row_specs.append((meta, is_alive, is_unspotted_enemy, lamp_on, fw, hp_col))
+            sig_rows.append((meta.vehicle_id, is_alive, is_unspotted_enemy, lamp_on, fw, hp_col))
 
-            # 行矩形边界（存活全宽，阵亡贴外侧缩进）
+        panel_sig = (alive_cnt, cur_total_hp, tuple(sig_rows))
+        if is_ally:
+            if panel_sig == self._canvas_has_ally_ear_key:
+                return
+            ear_panel = self._ally_ear_panel
+            bg_rgb = self._ally_ear_bg_rgb
+            prev_hdr_key = self._ally_ear_hdr_key
+            prev_row_sigs = self._ally_ear_row_sigs
+        else:
+            if panel_sig == self._canvas_has_enemy_ear_key:
+                return
+            ear_panel = self._enemy_ear_panel
+            bg_rgb = self._enemy_ear_bg_rgb
+            prev_hdr_key = self._enemy_ear_hdr_key
+            prev_row_sigs = self._enemy_ear_row_sigs
+
+        # 1. 仅当团队人数或总血量变化时重绘顶栏
+        hdr_key = (alive_cnt, cur_total_hp)
+        if hdr_key != prev_hdr_key:
+            hdr_bg = bg_rgb.crop((0, 0, w, EARS_HEADER_H + 1))
+            hdr_rgba = self._get_ear_header_rgba(w, is_ally, alive_cnt, len(roster), cur_total_hp, max_total_hp)
+            hdr_bg.paste(hdr_rgba, (0, 0), hdr_rgba)
+            ear_panel.paste(hdr_bg, (0, 0))
+            if is_ally:
+                self._ally_ear_hdr_key = hdr_key
+            else:
+                self._enemy_ear_hdr_key = hdr_key
+
+        # 2. 逐行槽位脏检查：仅重绘状态/血量/排序发生变化的 1-2 行（跳过未变化的 10+ 行！）
+        row_pad_x = 8
+        full_row_w = w - row_pad_x * 2      # 482px
+        dead_row_w = full_row_w - 136       # 346px
+        row_start_y = EARS_HEADER_H + 6     # 42
+        pd = ImageDraw.Draw(ear_panel)
+
+        num_rows = len(row_specs)
+        for idx in range(12):
+            ry = row_start_y + idx * (EARS_ROW_H + EARS_ROW_GAP)
+            cur_sig = sig_rows[idx] if idx < num_rows else None
+            if cur_sig == prev_row_sigs[idx]:
+                continue
+            prev_row_sigs[idx] = cur_sig
+
+            # 用底图局部行切片擦除旧行（高度 EARS_ROW_H + 1 覆盖 1px 底边框）
+            strip = bg_rgb.crop((0, ry, w, ry + EARS_ROW_H + 1))
+            ear_panel.paste(strip, (0, ry))
+            if cur_sig is None:
+                continue
+
+            meta, is_alive, is_unspotted_enemy, lamp_on, fw, hp_col = row_specs[idx]
             if is_alive:
                 rx0 = row_pad_x
                 rx1 = rx0 + full_row_w
-            else:
-                if is_ally:
-                    rx0 = row_pad_x
-                    rx1 = rx0 + dead_row_w
-                else:
-                    rx1 = w - row_pad_x
-                    rx0 = rx1 - dead_row_w
-
-            # 行底色与边框：存活行保持深色实体卡片质感（图6不变），沉没行大幅降低二层透明度
-            if not is_alive:
-                row_fill = self.theme.glass_row_dead
-                row_border = (255, 255, 255, 16)
-            elif meta.relation == RELATION_SELF:
-                row_fill = self.theme.glass_row_self
-                row_border = self.theme.accent_gold
-            elif is_unspotted_enemy:
-                row_fill = self.theme.glass_row_unspotted
-                row_border = (255, 255, 255, 26)
-            else:
-                row_fill = self.theme.glass_row
-                row_border = (255, 255, 255, 30)
-
-            rd.rectangle([rx0, ry, rx1, ry + EARS_ROW_H], fill=row_fill, outline=row_border, width=1)
-
-            # 5px 侧边阵营竖条 (.row-edge)
-            if not is_alive:
-                edge_col = (70, 74, 82, 95)
-            elif meta.relation == RELATION_SELF:
-                edge_col = self.theme.self_color
-            elif meta.relation == RELATION_DIVISION:
-                edge_col = self.theme.division_color
             elif is_ally:
-                edge_col = self.theme.ally_color
+                rx0 = row_pad_x
+                rx1 = rx0 + dead_row_w
             else:
-                edge_col = self.theme.enemy_color if is_spotted else (196, 78, 76, 215)
+                rx1 = w - row_pad_x
+                rx0 = rx1 - dead_row_w
 
-            if is_ally:
-                rd.rectangle([rx0, ry, rx0 + 5, ry + EARS_ROW_H], fill=edge_col)
-            else:
-                rd.rectangle([rx1 - 5, ry, rx1, ry + EARS_ROW_H], fill=edge_col)
+            row_rgba = self._get_ear_row_base(meta, w, is_ally, is_alive, is_unspotted_enemy, lamp_on)
+            ear_panel.paste(row_rgba, (rx0, ry), row_rgba)
 
-            # 点亮灯状态（友军：被敌亮；敌军：当前在点）
-            lamp_on = bool(st and (st.is_detected_by_enemy if is_ally else st.is_spotted))
-
-            # 舰种图标色与文字色（存活灭点敌舰保持清晰可读，与沉没灰暗行形成鲜明分层）
-            if not is_alive:
-                icon_col = self.theme.dead_icon
-                nick_col = self.theme.dead_text
-                ship_col = (98, 104, 114, 140)
-            elif meta.relation in (RELATION_SELF, RELATION_DIVISION):
-                icon_col = self.theme.division_color if meta.relation == RELATION_DIVISION else self.theme.self_color
-                nick_col = self.theme.division_color
-                ship_col = self.theme.text_ship_sub
-            elif is_ally or is_spotted:
-                icon_col = (244, 246, 250, 248)
-                nick_col = self.theme.text_primary
-                ship_col = self.theme.text_ship_sub
-            else:
-                # 敌方存活但灭点/未发现：保留清晰亮银文字与红边，一眼区分于底部半透灰暗沉没行
-                icon_col = (196, 202, 212, 220)
-                nick_col = (210, 216, 224, 238)
-                ship_col = (168, 176, 188, 226)
-
-            cls_icon = self.icons.get_hud_class_icon(
-                species=meta.species,
-                color=icon_col,
-                size=26,
-                flip_left=(not is_ally),
-            )
-
-            full_nick = f"[{meta.clan_tag}]{meta.player_name}" if meta.clan_tag else meta.player_name
-            tier_txt = ROMAN_TIERS.get(meta.level, str(meta.level))
-            ship_disp = self._ship_name(meta)
-            ship_sub = f"{tier_txt} {ship_disp}" if is_ally else f"{ship_disp} {tier_txt}"
-
-            if is_ally:
-                ear_layer.alpha_composite(cls_icon, (rx0 + 10, ry + (EARS_ROW_H - 26) // 2))
-                text_left = rx0 + 42
-                text_right = (rx1 - hp_bar_w - 18) if is_alive else (rx1 - 12)
-
-                # Line 1: 点亮灯 + [CLAN]玩家名
-                nick_x = text_left
-                if is_alive:
-                    ly_c = ry + 13
-                    if lamp_on:
-                        rd.ellipse([nick_x - 3, ly_c - 6, nick_x + 9, ly_c + 6], fill=self.theme.spot_lamp_glow)
-                        rd.ellipse([nick_x, ly_c - 3, nick_x + 6, ly_c + 3], fill=self.theme.spot_lamp_on)
-                    else:
-                        rd.ellipse([nick_x, ly_c - 3, nick_x + 6, ly_c + 3], fill=self.theme.spot_lamp_off)
-                    nick_x += 13
-                rd.text(
-                    (nick_x, ry + 5),
-                    _truncate_text(rd, full_nick, nick_font, max(24, text_right - nick_x)),
-                    font=nick_font,
-                    fill=nick_col,
-                )
-                # Line 2: 等级 + 中文船名
-                rd.text(
-                    (text_left, ry + 23),
-                    _truncate_text(rd, ship_sub, ship_font, max(24, text_right - text_left)),
-                    font=ship_font,
-                    fill=ship_col,
-                )
-
-                # 右侧连续长条三色血条（100-70 绿 / 70-30 黄 / 30-0 红，无击杀角标）
-                if is_alive:
+            if is_alive and fw > 0:
+                by0 = ry + (EARS_ROW_H - hp_bar_h) // 2
+                by1 = by0 + hp_bar_h
+                if is_ally:
                     bx1 = rx1 - 10
                     bx0 = bx1 - hp_bar_w
-                    by0 = ry + (EARS_ROW_H - hp_bar_h) // 2
-                    by1 = by0 + hp_bar_h
-                    rd.rectangle([bx0, by0, bx1, by1], fill=self.theme.hp_track, outline=self.theme.hp_border, width=1)
-                    if ratio > 0:
-                        fw = max(2, round((hp_bar_w - 2) * ratio))
-                        rd.rectangle([bx0 + 1, by0 + 1, bx0 + 1 + fw, by1 - 1], fill=self.hp_threshold_color(ratio))
-            else:
-                # 敌方完全对称镜像（从右向左排布）
-                ear_layer.alpha_composite(cls_icon, (rx1 - 10 - 26, ry + (EARS_ROW_H - 26) // 2))
-                text_right = rx1 - 42
-                text_left = (rx0 + hp_bar_w + 18) if is_alive else (rx0 + 12)
-
-                # Line 1: [CLAN]玩家名 + 点亮灯
-                nick_r = text_right
-                if is_alive:
-                    ly_c = ry + 13
-                    lx = nick_r - 6
-                    if lamp_on:
-                        rd.ellipse([lx - 3, ly_c - 6, lx + 9, ly_c + 6], fill=self.theme.spot_lamp_glow)
-                        rd.ellipse([lx, ly_c - 3, lx + 6, ly_c + 3], fill=self.theme.spot_lamp_on)
-                    else:
-                        rd.ellipse([lx, ly_c - 3, lx + 6, ly_c + 3], fill=self.theme.spot_lamp_off)
-                    nick_r -= 13
-                rd.text(
-                    (nick_r, ry + 5),
-                    _truncate_text(rd, full_nick, nick_font, max(24, nick_r - text_left)),
-                    font=nick_font,
-                    fill=nick_col,
-                    anchor="ra",
-                )
-                # Line 2: 中文船名 + 等级
-                rd.text(
-                    (text_right, ry + 23),
-                    _truncate_text(rd, ship_sub, ship_font, max(24, text_right - text_left)),
-                    font=ship_font,
-                    fill=ship_col,
-                    anchor="ra",
-                )
-
-                # 左侧连续长条三色血条（从右向左收缩，无击杀角标）
-                if is_alive:
+                    pd.rectangle([bx0 + 1, by0 + 1, bx0 + 1 + fw, by1 - 1], fill=hp_col[:3])
+                else:
                     bx0 = rx0 + 10
                     bx1 = bx0 + hp_bar_w
-                    by0 = ry + (EARS_ROW_H - hp_bar_h) // 2
-                    by1 = by0 + hp_bar_h
-                    rd.rectangle([bx0, by0, bx1, by1], fill=self.theme.hp_track, outline=self.theme.hp_border, width=1)
-                    if ratio > 0:
-                        fw = max(2, round((hp_bar_w - 2) * ratio))
-                        rd.rectangle([bx1 - 1 - fw, by0 + 1, bx1 - 1, by1 - 1], fill=self.hp_threshold_color(ratio))
+                    pd.rectangle([bx1 - 1 - fw, by0 + 1, bx1 - 1, by1 - 1], fill=hp_col[:3])
 
-        canvas.alpha_composite(ear_layer, dest=(x, EARS_Y))
+        if is_ally:
+            self._ally_ear_cache_key = panel_sig
+            self._canvas_has_ally_ear_key = panel_sig
+        else:
+            self._enemy_ear_cache_key = panel_sig
+            self._canvas_has_enemy_ear_key = panel_sig
+        canvas.paste(ear_panel, (x, EARS_Y))
 
     # =========================================================================
-    # 左下主角战报（纯扁平连续三色血条 + 官方战绩图标）
+    # 左下主角战报（静态底图预烘焙 + 增量缓存）
     # =========================================================================
 
-    def _draw_self_stats_widget(
-        self, canvas: Image.Image, d: ImageDraw.ImageDraw, frame: BattleFrame
-    ) -> None:
-        x = LEFT_X + 16
-        y = SELF_CARD_Y
-        inner_w = LEFT_W - 32
+    def _draw_self_stats_widget(self, canvas: Image.Image, frame: BattleFrame) -> None:
         own_meta = self.timeline.ships_meta.get(self.timeline.player_vehicle_id)
         own_st = frame.ships.get(self.timeline.player_vehicle_id)
-
-        title = (
-            self._t("hud_self_title_ship", ship=self._ship_name(own_meta))
-            if own_meta
-            else self._t("hud_self_title")
-        )
-        d.text(
-            (x, y + 16),
-            _truncate_text(d, title, self.fonts.get(15, bold=True), inner_w),
-            font=self.fonts.get(15, bold=True),
-            fill=self.theme.text_primary,
-            anchor="lm",
-        )
 
         hp = own_st.hp if (own_st and own_st.is_alive) else 0
         max_hp = (own_st.max_hp if own_st and own_st.max_hp > 0 else (own_meta.max_hp if own_meta else 1)) or 1
         heal_lim = own_st.healable_hp if (own_st and own_st.is_alive) else 0
+        ss = frame.self_stats
+
+        skey = (hp, max_hp, heal_lim, ss.enemy_damage, ss.potential_damage, ss.spotting_damage, ss.kills)
+        if skey == self._canvas_has_self_key:
+            return
+        if skey == self._self_cache_key and self._self_cache_img is not None:
+            canvas.paste(self._self_cache_img, (LEFT_X, SELF_CARD_Y))
+            self._canvas_has_self_key = skey
+            return
+
+        panel = self._self_card_base_rgb.copy()
+        d = ImageDraw.Draw(panel, "RGBA")
+        x = 16
+        inner_w = LEFT_W - 32
+
         ratio = max(0.0, min(1.0, hp / max_hp))
         heal_ratio = max(ratio, min(1.0, heal_lim / max_hp)) if heal_lim > hp else ratio
 
         hp_col = self.hp_threshold_color(ratio) if hp > 0 else self.theme.dead_text
         hp_cur_txt = _fmt_num(hp) if hp > 0 else self._t("hud_sunk")
         hp_max_txt = f" / {_fmt_num(max_hp)}"
-        max_b = d.textbbox((0, 0), hp_max_txt, font=self.fonts.get(14, bold=False))
+        f14 = self.fonts.get(14, bold=False)
+        max_b = d.textbbox((0, 0), hp_max_txt, font=f14)
         max_w = max_b[2] - max_b[0]
-        d.text((x + inner_w, y + 48), hp_max_txt, font=self.fonts.get(14, bold=False), fill=self.theme.text_secondary, anchor="rm")
-        d.text((x + inner_w - max_w, y + 47), hp_cur_txt, font=self.fonts.get(16, bold=True), fill=hp_col, anchor="rm")
-        d.text((x, y + 48), self._t("hud_hp_pct", pct=int(round(ratio * 100))), font=self.fonts.get(14, bold=False), fill=self.theme.text_secondary, anchor="lm")
+        d.text((x + inner_w, 48), hp_max_txt, font=f14, fill=self.theme.text_secondary, anchor="rm")
+        d.text((x + inner_w - max_w, 47), hp_cur_txt, font=self.fonts.get(16, bold=True), fill=hp_col, anchor="rm")
+        d.text((x, 48), self._t("hud_hp_pct", pct=int(round(ratio * 100))), font=f14, fill=self.theme.text_secondary, anchor="lm")
 
         # 大号纯扁平连续三色矩形血条（严禁剪影；100-70 绿 / 70-30 黄 / 30-0 红）
         bx0, bx1 = x, x + inner_w
-        by0, by1 = y + 63, y + 79
+        by0, by1 = 63, 79
         d.rectangle([bx0, by0, bx1, by1], fill=self.theme.hp_track, outline=self.theme.hp_border, width=1)
         bar_span = bx1 - bx0 - 2
         if heal_ratio > ratio:
@@ -1171,158 +1591,179 @@ class MinimapFrameRenderer:
             fw = max(2, round(bar_span * ratio))
             d.rectangle([bx0 + 1, by0 + 1, bx0 + 1 + fw, by1 - 1], fill=hp_col)
 
-        rows = [
-            (self._t("hud_dmg_caused"), "caused", _fmt_num(frame.self_stats.enemy_damage), 24, self.theme.text_primary),
-            (self._t("hud_dmg_potential"), "blocked", _fmt_num(frame.self_stats.potential_damage), 18, self.theme.text_primary),
-            (self._t("hud_dmg_spotting"), "assisted", _fmt_num(frame.self_stats.spotting_damage), 18, self.theme.text_primary),
-            (self._t("hud_kills"), "frag", str(frame.self_stats.kills), 19, self.theme.division_color),
-        ]
-        cy = y + 108
-        for idx, (label, icon_kind, val_str, val_sz, val_col) in enumerate(rows):
-            lbl_font = self.fonts.get(17 if idx == 0 else 14, bold=(idx == 0))
-            d.text((x, cy), label, font=lbl_font, fill=self.theme.text_primary if idx == 0 else self.theme.text_secondary, anchor="lm")
-            lb = d.textbbox((x, cy), label, font=lbl_font, anchor="lm")
-            ic = (
-                self.icons.get_frag_icon(0, height=17)
-                if icon_kind == "frag"
-                else self.icons.get_damage_counter_icon(icon_kind, size=20 if idx == 0 else 17)
-            )
-            if ic is not None:
-                canvas.alpha_composite(ic, (lb[2] + 10, round(cy - ic.height / 2)))
+        val_rows = (
+            (_fmt_num(ss.enemy_damage), 24, self.theme.text_primary, 108),
+            (_fmt_num(ss.potential_damage), 18, self.theme.text_primary, 146),
+            (_fmt_num(ss.spotting_damage), 18, self.theme.text_primary, 180),
+            (str(ss.kills), 19, self.theme.division_color, 214),
+        )
+        for val_str, val_sz, val_col, cy in val_rows:
             d.text((x + inner_w, cy), val_str, font=self.fonts.get(val_sz, bold=True), fill=val_col, anchor="rm")
-            if idx < len(rows) - 1:
-                d.line([(x, cy + 19), (x + inner_w, cy + 19)], fill=self.theme.hairline, width=1)
-            cy += 38 if idx == 0 else 34
+
+        self._self_cache_key = skey
+        self._self_cache_img = panel
+        canvas.paste(panel, (LEFT_X, SELF_CARD_Y))
+        self._canvas_has_self_key = skey
 
     # =========================================================================
-    # 中央底部专属局内聊天区域 (860 × 122 60% 黑色半透明玻璃面板)
+    # 中央底部专属局内聊天区域（内容变化时才重绘，缓存命中直接贴图）
     # =========================================================================
 
-    def _draw_chat_panel(self, d: ImageDraw.ImageDraw, frame: BattleFrame) -> None:
-        x = CENTER_X + 16
-        y = CHAT_Y
+    def _draw_chat_panel(self, canvas: Image.Image, frame: BattleFrame) -> None:
+        recent = frame.chat_messages[-4:]
+        ckey = (
+            len(frame.chat_messages),
+            tuple((cm.time_left, cm.channel, cm.sender_vehicle_id, cm.sender_name, cm.text) for cm in recent),
+        )
+        if ckey == self._canvas_has_chat_key:
+            return
+        if ckey == self._chat_cache_key and self._chat_cache_img is not None:
+            canvas.paste(self._chat_cache_img, (CENTER_X, CHAT_Y))
+            self._canvas_has_chat_key = ckey
+            return
 
-        d.text((x, y + 14), self._t("hud_chat_title", n=len(frame.chat_messages)), font=self.fonts.get(14, bold=True), fill=self.theme.text_secondary, anchor="lm")
+        panel = self._chat_bg_rgb.copy()
+        d = ImageDraw.Draw(panel, "RGBA")
+        x = 16
+
+        d.text((x, 14), self._t("hud_chat_title", n=len(frame.chat_messages)), font=self.fonts.get(14, bold=True), fill=self.theme.text_secondary, anchor="lm")
         d.text(
-            (CENTER_X + CENTER_W - 16, y + 14),
+            (CENTER_W - 16, 14),
             self._t("hud_chat_sub"),
             font=self.fonts.get(12, bold=False),
             fill=self.theme.text_muted,
             anchor="rm",
         )
 
-        recent = frame.chat_messages[-4:]
         if not recent:
             d.text(
-                (CENTER_X + CENTER_W // 2, y + 74),
+                (CENTER_W // 2, 74),
                 self._t("hud_chat_empty"),
                 font=self.fonts.get(14, bold=False),
                 fill=self.theme.text_muted,
                 anchor="mm",
             )
+        else:
+            time_font = self.fonts.get(13, bold=False)
+            meta_font = self.fonts.get(14, bold=True)
+            msg_font = self.fonts.get(14, bold=False)
+            ry = 42
+
+            for cm in recent:
+                cx = x
+                t_str = _fmt_mmss(cm.time_left)
+                d.text((cx, ry), t_str, font=time_font, fill=self.theme.text_muted, anchor="lm")
+                cx += 46
+
+                if cm.channel == "battle_team":
+                    ch_col = self.theme.ally_color
+                elif "division" in cm.channel or "prebattle" in cm.channel:
+                    ch_col = self.theme.division_color
+                else:
+                    ch_col = self.theme.accent_gold
+                ch_txt = f"[{translate_chat_channel(cm.channel, self.lang)}]"
+                d.text((cx, ry), ch_txt, font=meta_font, fill=ch_col, anchor="lm")
+                cb = d.textbbox((cx, ry), ch_txt, font=meta_font, anchor="lm")
+                cx = cb[2] + 8
+
+                sender_col = (
+                    self._relation_color(cm.sender_relation)
+                    if cm.sender_relation in (RELATION_SELF, RELATION_ALLY, RELATION_ENEMY, RELATION_DIVISION)
+                    else self.theme.text_secondary
+                )
+                sender_ship = (
+                    self._ship_names_by_vid.get(cm.sender_vehicle_id, cm.sender_ship_zh)
+                    if cm.sender_vehicle_id is not None
+                    else cm.sender_ship_zh
+                )
+                ship_part = f"({sender_ship})" if sender_ship else ""
+                sender_str = f"{cm.sender_name}{ship_part}:"
+                d.text((cx, ry), sender_str, font=meta_font, fill=sender_col, anchor="lm")
+                sb = d.textbbox((cx, ry), sender_str, font=meta_font, anchor="lm")
+                cx = sb[2] + 9
+
+                rem_w = (CENTER_W - 16) - cx
+                if rem_w > 24:
+                    msg_txt = _truncate_text(d, cm.text, msg_font, rem_w)
+                    d.text((cx, ry), msg_txt, font=msg_font, fill=self.theme.text_primary, anchor="lm")
+                ry += 22
+
+        self._chat_cache_key = ckey
+        self._chat_cache_img = panel
+        canvas.paste(panel, (CENTER_X, CHAT_Y))
+        self._canvas_has_chat_key = ckey
+
+    # =========================================================================
+    # 右下官方击杀播报（内容变化时才重绘，缓存命中直接贴图）
+    # =========================================================================
+
+    def _draw_kill_feed(self, canvas: Image.Image, frame: BattleFrame) -> None:
+        recent = frame.kills[-12:]
+        kkey = (
+            len(frame.kills),
+            tuple((ev.killer_vehicle_id, ev.victim_vehicle_id, ev.death_type_id) for ev in recent),
+        )
+        if kkey == self._canvas_has_kill_key:
+            return
+        if kkey == self._kill_cache_key and self._kill_cache_img is not None:
+            canvas.paste(self._kill_cache_img, (RIGHT_X, KILL_CARD_Y))
+            self._canvas_has_kill_key = kkey
             return
 
-        time_font = self.fonts.get(13, bold=False)
-        meta_font = self.fonts.get(14, bold=True)
-        msg_font = self.fonts.get(14, bold=False)
-        ry = y + 42
-
-        for cm in recent:
-            cx = x
-            t_str = _fmt_mmss(cm.time_left)
-            d.text((cx, ry), t_str, font=time_font, fill=self.theme.text_muted, anchor="lm")
-            cx += 46
-
-            if cm.channel == "battle_team":
-                ch_col = self.theme.ally_color
-            elif "division" in cm.channel or "prebattle" in cm.channel:
-                ch_col = self.theme.division_color
-            else:
-                ch_col = self.theme.accent_gold
-            ch_txt = f"[{translate_chat_channel(cm.channel, self.lang)}]"
-            d.text((cx, ry), ch_txt, font=meta_font, fill=ch_col, anchor="lm")
-            cb = d.textbbox((cx, ry), ch_txt, font=meta_font, anchor="lm")
-            cx = cb[2] + 8
-
-            sender_col = (
-                self._relation_color(cm.sender_relation)
-                if cm.sender_relation in (RELATION_SELF, RELATION_ALLY, RELATION_ENEMY, RELATION_DIVISION)
-                else self.theme.text_secondary
-            )
-            sender_ship = (
-                self._ship_names_by_vid.get(cm.sender_vehicle_id, cm.sender_ship_zh)
-                if cm.sender_vehicle_id is not None
-                else cm.sender_ship_zh
-            )
-            ship_part = f"({sender_ship})" if sender_ship else ""
-            sender_str = f"{cm.sender_name}{ship_part}:"
-            d.text((cx, ry), sender_str, font=meta_font, fill=sender_col, anchor="lm")
-            sb = d.textbbox((cx, ry), sender_str, font=meta_font, anchor="lm")
-            cx = sb[2] + 9
-
-            rem_w = (CENTER_X + CENTER_W - 16) - cx
-            if rem_w > 24:
-                msg_txt = _truncate_text(d, cm.text, msg_font, rem_w)
-                d.text((cx, ry), msg_txt, font=msg_font, fill=self.theme.text_primary, anchor="lm")
-            ry += 22
-
-    # =========================================================================
-    # 右下官方击杀播报（60% 黑色半透明玻璃面板，最多显示 12 条，官方舰种 + 武器图标）
-    # =========================================================================
-
-    def _draw_kill_feed(
-        self, canvas: Image.Image, d: ImageDraw.ImageDraw, frame: BattleFrame
-    ) -> None:
-        x = RIGHT_X + 16
-        y = KILL_CARD_Y
+        panel = self._kill_bg_rgb.copy()
+        d = ImageDraw.Draw(panel, "RGBA")
+        x = 16
         inner_w = RIGHT_W - 32
-        d.text((x, y + 16), self._t("hud_killfeed_title", n=len(frame.kills)), font=self.fonts.get(15, bold=True), fill=self.theme.text_primary, anchor="lm")
+        d.text((x, 16), self._t("hud_killfeed_title", n=len(frame.kills)), font=self.fonts.get(15, bold=True), fill=self.theme.text_primary, anchor="lm")
 
-        recent = frame.kills[-12:]
         if not recent:
             d.text(
-                (RIGHT_X + RIGHT_W // 2, y + KILL_CARD_H // 2),
+                (RIGHT_W // 2, KILL_CARD_H // 2),
                 self._t("hud_killfeed_empty"),
                 font=self.fonts.get(14, bold=False),
                 fill=self.theme.text_muted,
                 anchor="mm",
             )
-            return
+        else:
+            row_font = self.fonts.get(14, bold=True)
+            cx = RIGHT_W // 2
+            ry = 48
 
-        row_font = self.fonts.get(14, bold=True)
-        cx = RIGHT_X + RIGHT_W // 2
-        ry = y + 48
+            for ev in reversed(recent):
+                km = self.timeline.ships_meta.get(ev.killer_vehicle_id)
+                vm = self.timeline.ships_meta.get(ev.victim_vehicle_id)
+                k_name = self._ship_name(km)
+                v_name = self._ship_name(vm)
+                k_col = self._relation_color(km.relation) if km else self.theme.text_secondary
+                v_col = self._relation_color(vm.relation) if vm else self.theme.text_secondary
 
-        for ev in reversed(recent):
-            km = self.timeline.ships_meta.get(ev.killer_vehicle_id)
-            vm = self.timeline.ships_meta.get(ev.victim_vehicle_id)
-            k_name = self._ship_name(km)
-            v_name = self._ship_name(vm)
-            k_col = self._relation_color(km.relation) if km else self.theme.text_secondary
-            v_col = self._relation_color(vm.relation) if vm else self.theme.text_secondary
+                frag_ic = self.icons.get_frag_icon(ev.death_type_id, height=17)
+                if frag_ic is not None:
+                    _blit_rgba(panel, frag_ic, round(cx - frag_ic.width / 2), round(ry - frag_ic.height / 2))
+                    half_gap = max(18, frag_ic.width // 2 + 8)
+                else:
+                    d.text((cx, ry), ev.death_type_zh, font=self.fonts.get(12, bold=True), fill=self.theme.text_secondary, anchor="mm")
+                    half_gap = 22
 
-            frag_ic = self.icons.get_frag_icon(ev.death_type_id, height=17)
-            if frag_ic is not None:
-                canvas.alpha_composite(frag_ic, (round(cx - frag_ic.width / 2), round(ry - frag_ic.height / 2)))
-                half_gap = max(18, frag_ic.width // 2 + 8)
-            else:
-                d.text((cx, ry), ev.death_type_zh, font=self.fonts.get(12, bold=True), fill=self.theme.text_secondary, anchor="mm")
-                half_gap = 22
+                k_icon_x = cx - half_gap - 22
+                if km is not None:
+                    ki = self.icons.get_hud_class_icon(km.species, k_col, size=22, flip_left=False)
+                    _blit_rgba(panel, ki, k_icon_x, round(ry - ki.height / 2))
+                k_max_w = max(60, k_icon_x - x - 6)
+                d.text((k_icon_x - 6, ry), _truncate_text(d, k_name, row_font, k_max_w), font=row_font, fill=k_col, anchor="rm")
 
-            k_icon_x = cx - half_gap - 22
-            if km is not None:
-                ki = self.icons.get_hud_class_icon(km.species, k_col, size=22, flip_left=False)
-                canvas.alpha_composite(ki, (k_icon_x, round(ry - ki.height / 2)))
-            k_max_w = max(60, k_icon_x - x - 6)
-            d.text((k_icon_x - 6, ry), _truncate_text(d, k_name, row_font, k_max_w), font=row_font, fill=k_col, anchor="rm")
+                v_icon_x = cx + half_gap
+                if vm is not None:
+                    vi = self.icons.get_hud_class_icon(vm.species, v_col, size=22, flip_left=True)
+                    _blit_rgba(panel, vi, v_icon_x, round(ry - vi.height / 2))
+                v_txt_x = v_icon_x + 26
+                v_max_w = max(60, (RIGHT_W - 16) - v_txt_x)
+                d.text((v_txt_x, ry), _truncate_text(d, v_name, row_font, v_max_w), font=row_font, fill=v_col, anchor="lm")
 
-            v_icon_x = cx + half_gap
-            if vm is not None:
-                vi = self.icons.get_hud_class_icon(vm.species, v_col, size=22, flip_left=True)
-                canvas.alpha_composite(vi, (v_icon_x, round(ry - vi.height / 2)))
-            v_txt_x = v_icon_x + 26
-            v_max_w = max(60, (RIGHT_X + RIGHT_W - 16) - v_txt_x)
-            d.text((v_txt_x, ry), _truncate_text(d, v_name, row_font, v_max_w), font=row_font, fill=v_col, anchor="lm")
+                d.line([(x, ry + 14), (x + inner_w, ry + 14)], fill=(255, 255, 255, 16), width=1)
+                ry += 28
 
-            d.line([(x, ry + 14), (x + inner_w, ry + 14)], fill=(255, 255, 255, 16), width=1)
-            ry += 28
+        self._kill_cache_key = kkey
+        self._kill_cache_img = panel
+        canvas.paste(panel, (RIGHT_X, KILL_CARD_Y))
+        self._canvas_has_kill_key = kkey

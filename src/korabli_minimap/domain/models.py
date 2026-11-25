@@ -142,7 +142,7 @@ class ShellTracer:
 
 @dataclass(frozen=True)
 class PlaneState:
-    """小地图航空中队快照。"""
+    """小地图航空中队快照（含官方图标分类名与插值平滑后的位置）。"""
 
     plane_id: int
     team_id: int
@@ -151,6 +151,21 @@ class PlaneState:
     z: float
     yaw_rad: float
     purpose: int            # 0=作战中, 1=返航中
+    params_id: int = 0
+    icon_name: str = "bomber_he"
+    is_consumable: bool = False
+
+
+@dataclass(frozen=True)
+class FighterWardState:
+    """巡逻战斗机/防空拦截圈（receive_wardAdded，wardTypes=2 圆形巡逻圈）。"""
+
+    squadron_id: int
+    team_id: int
+    relation: int
+    x: float
+    z: float
+    radius_bw: float
 
 
 @dataclass(frozen=True)
@@ -195,6 +210,7 @@ class BattleFrame:
     kills: tuple[KillEvent, ...]
     chat_messages: tuple[ChatMessage, ...] = ()
     self_stats: SelfBattleStats = field(default_factory=SelfBattleStats)
+    fighter_wards: tuple[FighterWardState, ...] = ()
 
 
 @dataclass

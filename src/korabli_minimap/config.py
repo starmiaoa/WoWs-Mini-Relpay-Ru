@@ -107,6 +107,8 @@ class RenderConfig:
     output_width: int = 1920           # 输出视频宽度（默认 1K 1920）
     output_height: int = 1080          # 输出视频高度（默认 1K 1080）
     language: str = "zh_CN"            # 渲染器界面语言: zh_CN / zh_TW / ru / en
+    encoder: str = "auto"              # 视频编码器: auto (优先 NVENC/AMF/QSV，回退 libx264) | x264 | nvenc | amf | qsv
+    render_workers: int = 0            # 并发渲染线程数: 0 = 自动按 CPU 核心数自适应
     seconds_per_frame: float = 1.0
     end_banner_seconds: float = 2.5
 

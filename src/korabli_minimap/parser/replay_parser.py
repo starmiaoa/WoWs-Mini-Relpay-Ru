@@ -296,6 +296,9 @@ def parse_replay(
                     "receive_addMinimapSquadron",
                     "receive_updateMinimapSquadron",
                     "receive_removeMinimapSquadron",
+                    "receive_deactivateSquadron",
+                    "receive_wardAdded",
+                    "receive_wardRemoved",
                     "onChatMessageRegular",
                     "onBattleEnd",
                 }:
@@ -323,11 +326,24 @@ def parse_replay(
                 elif mname == "receiveShotKills" and len(args) >= 1:
                     sm.on_shot_kills(args[0])
                 elif mname == "receive_addMinimapSquadron" and len(args) >= 5:
-                    sm.on_plane_add(int(args[0]), int(args[1]), args[3], int(args[4]))
+                    sm.on_plane_add(
+                        plane_id=int(args[0]),
+                        team_id=int(args[1]),
+                        params_id=int(args[2]),
+                        pos=args[3],
+                        purpose=int(args[4]),
+                        clock=clk,
+                    )
                 elif mname == "receive_updateMinimapSquadron" and len(args) >= 2:
-                    sm.on_plane_update(int(args[0]), args[1])
+                    sm.on_plane_update(int(args[0]), args[1], clock=clk)
                 elif mname == "receive_removeMinimapSquadron" and len(args) >= 1:
-                    sm.on_plane_remove(int(args[0]))
+                    sm.on_plane_remove(int(args[0]), clock=clk)
+                elif mname == "receive_deactivateSquadron" and len(args) >= 1:
+                    sm.on_plane_deactivate(int(args[0]))
+                elif mname == "receive_wardAdded" and len(args) >= 2:
+                    sm.on_ward_add(int(args[0]), args[1], clock=clk)
+                elif mname == "receive_wardRemoved" and len(args) >= 1:
+                    sm.on_ward_remove(int(args[0]))
                 elif mname == "onChatMessageRegular" and len(args) >= 1:
                     raw_blob = args[0]
                     if isinstance(raw_blob, (bytes, bytearray)) and raw_blob:

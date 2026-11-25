@@ -1,4 +1,4 @@
-"""一键打包免环境 Windows 便携版 EXE 与可分发 ZIP 压缩包。"""
+"""一键打包免环境 Windows 便携版 EXE 与可分发 ZIP / 7z 压缩包。"""
 
 from __future__ import annotations
 
@@ -12,38 +12,29 @@ import zipfile
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEC_PATH = PROJECT_ROOT / "packaging" / "WoWs-Mini-Relpay-Ru.spec"
+TUTORIAL_SRC = PROJECT_ROOT / "packaging" / "README.ZH-CN.txt"
 DIST_APP_DIR = PROJECT_ROOT / "dist" / "WoWs-Mini-Relpay-Ru"
 ZIP_OUT_PATH = PROJECT_ROOT / "dist" / "WoWs-Mini-Relpay-Ru-win64.zip"
+SEVENZ_OUT_PATH = PROJECT_ROOT / "dist" / "WoWs-Mini-Relpay-Ru-win64.7z"
 
-PORTABLE_README = """============================================================
-  WoWs-Mini-Relpay-Ru — 俄服《战舰世界》小地图回放渲染工具
-  免安装绿色版（无需 Python / uv / FFmpeg）
-============================================================
 
-【使用步骤】
-1. 请先将整个压缩包解压到任意文件夹（不要直接在压缩软件里双击）。
-2. 双击运行 WoWs-Mini-Relpay-Ru.exe 打开图形界面。
-3. 程序会自动识别本机的俄服正式服与 PT 测试服目录，也支持点击
-   “手动选择目录...”自由指定，并自动列出 replays 目录下的全部
-   .korablireplay 回放文件（显示中文船名、战斗时间与地图）。
-4. 首次使用时，点击“同步客户端数据”（或直接勾选回放点“开始批量生成”，
-   程序会自动同步约 3~5 秒），即可提取本地客户端地图、官方图标与汉化 mod 船名。
-5. 也可以将任意 .korablireplay 文件直接拖入窗口添加并自动勾选，
-   自由设置分辨率（默认 1920x1080）与帧率（默认 30fps）批量生成。
-6. 每次生成都会按当前时间在 output 目录下创建独立文件夹并自动打开。
-
-【俄服大版本更新 / 汉化 mod 更新后】
-- 游戏更新后，在界面右上角点击“同步客户端数据”即可自动适配新版本；
-- 仅更新汉化 mod 船名时，点击“仅同步汉化”即可（约 1 秒）。
-
-【项目地址】
-https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru
-"""
+def _find_7z_exe() -> str | None:
+    for name in ("7z", "7za"):
+        hit = shutil.which(name)
+        if hit:
+            return hit
+    for cand in (
+        Path(r"C:\Program Files\7-Zip\7z.exe"),
+        Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+    ):
+        if cand.is_file():
+            return str(cand)
+    return None
 
 
 def main() -> int:
     t0 = time.perf_counter()
-    print("[1/3] 正在运行 PyInstaller 构建独立绿色版 EXE ...")
+    print("[1/4] 正在运行 PyInstaller 构建独立绿色版 EXE ...")
     cmd = [
         sys.executable,
         "-m",
@@ -66,8 +57,11 @@ def main() -> int:
         print(f"[错误] 未找到构建产物: {exe_path}")
         return 1
 
-    print("[2/3] 正在写入便携版使用说明...")
-    (DIST_APP_DIR / "使用说明.txt").write_text(PORTABLE_README, encoding="utf-8")
+    print("[2/4] 正在写入便携版教程文件 README.ZH-CN.txt ...")
+    if not TUTORIAL_SRC.is_file():
+        print(f"[错误] 缺少教程源文件: {TUTORIAL_SRC}")
+        return 1
+    shutil.copyfile(TUTORIAL_SRC, DIST_APP_DIR / "README.ZH-CN.txt")
 
     # 确保便携包干净（不包含开发者个人缓存 data/ 或 output/）
     for extra in ("data", "output"):
@@ -75,7 +69,7 @@ def main() -> int:
         if ep.exists():
             shutil.rmtree(ep)
 
-    print(f"[3/3] 正在打包发布压缩包 -> {ZIP_OUT_PATH.name} ...")
+    print(f"[3/4] 正在打包 ZIP 发布包 -> {ZIP_OUT_PATH.name} ...")
     if ZIP_OUT_PATH.exists():
         ZIP_OUT_PATH.unlink()
 
@@ -84,6 +78,32 @@ def main() -> int:
             if file_path.is_file():
                 arcname = Path("WoWs-Mini-Relpay-Ru") / file_path.relative_to(DIST_APP_DIR)
                 zf.write(file_path, arcname=str(arcname))
+
+    print(f"[4/4] 正在打包 7z 发布包 -> {SEVENZ_OUT_PATH.name} ...")
+    sevenz_exe = _find_7z_exe()
+    sevenz_mb: float | None = None
+    if sevenz_exe:
+        if SEVENZ_OUT_PATH.exists():
+            SEVENZ_OUT_PATH.unlink()
+        zres = subprocess.run(
+            [
+                sevenz_exe,
+                "a",
+                "-t7z",
+                "-m0=lzma2",
+                "-mx=9",
+                "-mmt=on",
+                str(SEVENZ_OUT_PATH),
+                "WoWs-Mini-Relpay-Ru",
+            ],
+            cwd=PROJECT_ROOT / "dist",
+        )
+        if zres.returncode != 0:
+            print(f"[错误] 7-Zip 打包失败，退出码: {zres.returncode}")
+            return zres.returncode
+        sevenz_mb = SEVENZ_OUT_PATH.stat().st_size / (1024 * 1024)
+    else:
+        print("[警告] 未检测到 7-Zip (7z.exe)，跳过 .7z 打包。")
 
     dir_mb = sum(p.stat().st_size for p in DIST_APP_DIR.rglob("*") if p.is_file()) / (1024 * 1024)
     zip_mb = ZIP_OUT_PATH.stat().st_size / (1024 * 1024)
@@ -97,7 +117,9 @@ def main() -> int:
     print(f"\n[打包完成] 耗时 {dt:.1f}s")
     print(f"  绿色版目录 : {DIST_APP_DIR} ({dir_mb:.1f} MB)")
     print(f"  主程序 EXE : {exe_path}")
-    print(f"  发布压缩包 : {ZIP_OUT_PATH} ({zip_mb:.1f} MB)")
+    print(f"  ZIP 压缩包 : {ZIP_OUT_PATH} ({zip_mb:.1f} MB)")
+    if sevenz_mb is not None:
+        print(f"  7z  压缩包 : {SEVENZ_OUT_PATH} ({sevenz_mb:.1f} MB)")
     return 0
 
 

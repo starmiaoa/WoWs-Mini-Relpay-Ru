@@ -234,3 +234,107 @@ def test_official_korabli_icons_rasterization() -> None:
 
     assert factory.get_frag_icon(17, height=16) is not None
     assert factory.get_damage_counter_icon("caused", size=16) is not None
+
+
+def test_worker_clone_parity_and_encoder_scale_filter(tmp_path: Path) -> None:
+    import numpy as np
+    from korabli_minimap.renderer.video import (
+        _build_ffmpeg_scale_filter,
+        resolve_video_encoder,
+    )
+
+    # 1. 编码器显式 x264 与缩放滤镜测试
+    codec, params = resolve_video_encoder("x264")
+    assert codec == "libx264"
+    assert "-crf" in params
+    assert _build_ffmpeg_scale_filter(1920, 1080) is None
+    assert _build_ffmpeg_scale_filter(2560, 1440) == "scale=2560:1440:flags=lanczos"
+    non169 = _build_ffmpeg_scale_filter(1600, 1200)
+    assert non169 is not None and "force_original_aspect_ratio=decrease" in non169 and "pad=1600:1200" in non169
+
+    # 2. clone_for_worker 渲染结果必须与主渲染器完全逐像素一致
+    store = _make_dummy_store(tmp_path)
+    meta = {
+        "clientVersionFromExe": "26,11,1,8871067",
+        "mapName": "spaces/47_Sleeping_Giant",
+        "gameType": "RandomBattle",
+        "scenario": "domination_4point",
+        "duration": 1200,
+        "playerName": "tester",
+    }
+    sm = BattleStateMachine("dummy.korablireplay", meta, store)
+    sm.set_player_vehicle(1001)
+    sm.register_roster(
+        [
+            {"vehicle_id": 1001, "avatar_id": 1000, "account_db_id": 1, "team_id": 0, "ship_params_id": 4073633616, "max_hp": 83450, "player_name": "tester"},
+            {"vehicle_id": 2001, "avatar_id": 2000, "account_db_id": 2, "team_id": 1, "ship_params_id": 4179539920, "max_hp": 44400, "player_name": "enemy"},
+        ]
+    )
+    sm.on_vehicle_create(1001, -100.0, 200.0, 1.0, {"health": 70000, "maxHealth": 83450, "isAlive": 1}, 10.0)
+    sm.on_vehicle_create(2001, 100.0, -150.0, 2.0, {"health": 20000, "maxHealth": 44400, "isAlive": 1}, 10.0)
+    sm.on_smoke_create(5001, 100.0, -150.0, {"radius": 18.0, "points": [(100.0, -150.0)]}, 12.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1185}, 15.0, time_left_changed=True)
+    tl = sm.build_timeline()
+
+    main_ren = MinimapFrameRenderer(tl, store, RenderConfig())
+    clone_ren = main_ren.clone_for_worker()
+    a1 = np.asarray(main_ren.render_frame(tl.frames[0]), dtype=np.uint8)
+    a2 = np.asarray(clone_ren.render_frame(tl.frames[0]), dtype=np.uint8)
+    assert np.array_equal(a1, a2)
+
+
+def test_plane_icon_classification_ward_and_hermite_smoothing(tmp_path: Path) -> None:
+    store = _make_dummy_store(tmp_path)
+    store.aircrafts = {
+        "9001": {"id": 9001, "internal_name": "CV_FIGHTER_WARD", "species": "Fighter", "icon_name": "consumables_fighter", "is_consumable": True},
+        "9002": {"id": 9002, "internal_name": "CV_TORP", "species": "Bomber", "icon_name": "torpedo_regular", "is_consumable": False},
+    }
+    meta = {
+        "clientVersionFromExe": "26,11,1,8871067",
+        "mapName": "spaces/47_Sleeping_Giant",
+        "gameType": "RandomBattle",
+        "scenario": "domination_4point",
+        "duration": 1200,
+        "playerName": "tester",
+    }
+    sm = BattleStateMachine("dummy.korablireplay", meta, store)
+    sm.set_player_vehicle(1001)
+    sm.register_roster(
+        [
+            {"vehicle_id": 1001, "avatar_id": 1000, "account_db_id": 1, "team_id": 0, "ship_params_id": 4073633616, "max_hp": 83450, "player_name": "tester"},
+            {"vehicle_id": 2001, "avatar_id": 2000, "account_db_id": 2, "team_id": 1, "ship_params_id": 4179539920, "max_hp": 44400, "player_name": "enemy"},
+        ]
+    )
+    # 模拟服务器每 2.0s 下发一次飞机坐标（t=10, 12, 14），而战局每秒采样 1 帧（t=10, 11, 12, 13, 14）
+    sm.on_plane_add(7001, team_id=0, params_id=9002, pos=(0.0, 0.0), purpose=0, clock=10.0)
+    sm.on_plane_add(7002, team_id=1, params_id=9001, pos=(50.0, 50.0), purpose=0, clock=10.0)
+    sm.on_ward_add(7002, {"position": (50.0, 0.0, 50.0), "wardSize": (0.0, 100.0), "teamId": 1, "wardTypes": 2, "wardShape": 0, "timeRemaining": 60.0}, clock=10.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1190}, 10.0, time_left_changed=True)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1189}, 11.0, time_left_changed=True)
+    sm.on_plane_update(7001, (40.0, 0.0), clock=12.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1188}, 12.0, time_left_changed=True)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1187}, 13.0, time_left_changed=True)
+    sm.on_plane_update(7001, (80.0, 0.0), clock=14.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1186}, 14.0, time_left_changed=True)
+
+    tl = sm.build_timeline()
+    xs = [next(p.x for p in f.planes if p.plane_id == 7001) for f in tl.frames]
+    # 关键验证：t=11 和 t=13 的中间帧必须被平滑插值到 20.0 和 60.0，严禁卡在 0.0 / 40.0！
+    assert abs(xs[0] - 0.0) < 1e-3
+    assert abs(xs[1] - 20.0) < 1e-3
+    assert abs(xs[2] - 40.0) < 1e-3
+    assert abs(xs[3] - 60.0) < 1e-3
+    assert abs(xs[4] - 80.0) < 1e-3
+
+    # 验证图标映射与战斗机巡逻圈
+    p_fighter = next(p for p in tl.frames[0].planes if p.plane_id == 7002)
+    p_torp = next(p for p in tl.frames[0].planes if p.plane_id == 7001)
+    assert p_fighter.icon_name == "consumables_fighter" and p_fighter.is_consumable is True
+    assert p_torp.icon_name == "torpedo_regular" and p_torp.is_consumable is False
+    assert len(tl.frames[0].fighter_wards) == 1
+    assert tl.frames[0].fighter_wards[0].radius_bw == 100.0
+
+    # 验证渲染不报错
+    ren = MinimapFrameRenderer(tl, store, RenderConfig())
+    img = ren.render_frame(tl.frames[1])
+    assert img.size == (CANVAS_W, CANVAS_H)

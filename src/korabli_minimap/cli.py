@@ -75,6 +75,7 @@ def _cmd_render(args: argparse.Namespace) -> int:
         output_width=out_w,
         output_height=out_h,
         language=args.lang,
+        encoder=args.encoder,
         show_smoke=not args.no_smoke,
         show_unspotted_names=not args.no_unspotted_names,
         show_spotted_names=not args.no_spotted_names,
@@ -93,7 +94,7 @@ def _cmd_render(args: argparse.Namespace) -> int:
     )
     t2 = time.perf_counter()
     print(f"[渲染完成] 解析 {t1 - t0:.2f}s | 渲染+编码 {t2 - t1:.2f}s | 总耗时 {t2 - t0:.2f}s")
-    print(f"  输出视频 : {res.video_path} ({res.width}x{res.height}, {res.total_frames} 帧 @ {res.fps}fps)")
+    print(f"  输出视频 : {res.video_path} ({res.width}x{res.height}, {res.total_frames} 帧 @ {res.fps}fps, {res.encoder_used})")
     print(f"  地图/模式: {tl.map_zh_name} · {tl.battle_type_zh} ({tl.result_zh})")
     if res.keyframe_paths:
         print(f"  关键帧图 : 共导出 {len(res.keyframe_paths)} 张")
@@ -158,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ren.add_argument("--fps", type=int, default=30, help="输出帧率 / 播放倍速（默认 30，即 30 倍速）")
     p_ren.add_argument("--resolution", type=str, default="1920x1080", help="输出分辨率（宽x高，默认 1920x1080）")
     p_ren.add_argument("--lang", type=str, default="auto", choices=["auto", "zh_CN", "zh_TW", "ru", "en"], help="渲染画面语言（auto 跟随系统，或指定 zh_CN / zh_TW / ru / en）")
+    p_ren.add_argument("--encoder", type=str, default="auto", choices=["auto", "nvenc", "amf", "qsv", "x264"], help="视频编码器（默认 auto 自动优先 GPU 硬件编码，失败回退 x264）")
     p_ren.add_argument("--keyframes-dir", type=Path, default=None, help="同时导出代表性关键帧 PNG 到此目录")
     p_ren.add_argument("--max-frames", type=int, default=None, help="仅渲染前 N 帧（用于快速调试）")
     p_ren.add_argument("--no-smoke", action="store_true", help="关闭地图烟雾渲染")

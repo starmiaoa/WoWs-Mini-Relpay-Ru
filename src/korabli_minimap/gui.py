@@ -93,7 +93,7 @@ from .replay_catalog import (
 )
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 PROJECT_ROOT = get_app_root()
 REPO_URL = "https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru"
 
@@ -754,7 +754,8 @@ class BatchRenderWorker(QThread):
             if not raw_ver:
                 return
             short_ver = normalize_short_version(raw_ver)
-            if short_ver in synced:
+            ac_ready = (self.data_dir / "versions" / short_ver / "aircrafts.json").is_file()
+            if short_ver in synced and ac_ready:
                 return
             cinfo = locate_client(self.selected_game_dir)
             if cinfo.short_version == short_ver:
@@ -824,7 +825,7 @@ class BatchRenderWorker(QThread):
                 dt = time.perf_counter() - t0
                 ok_count += 1
                 mb = res.video_path.stat().st_size / (1024 * 1024)
-                self.log_signal.emit(f"  OK ({dt:.1f}s, {mb:.2f} MB) -> {res.video_path.name}")
+                self.log_signal.emit(f"  OK ({dt:.1f}s, {mb:.2f} MB, {res.encoder_used}) -> {res.video_path.name}")
             except RenderCancelledError:
                 self.log_signal.emit(f"  STOPPED: {item.filename}")
                 break

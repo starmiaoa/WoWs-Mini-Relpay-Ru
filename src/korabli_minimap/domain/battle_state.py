@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..extractor.store import VersionDataStore
@@ -13,6 +14,7 @@ from .models import (
     BattleTimeline,
     CaptureZoneState,
     ChatMessage,
+    FighterWardState,
     KillEvent,
     PlaneState,
     RELATION_ALLY,
@@ -154,6 +156,21 @@ class _MutablePlane:
     prev_z: float
     yaw_rad: float = 0.0
     purpose: int = 0
+    params_id: int = 0
+    icon_name: str = "bomber_he"
+    is_consumable: bool = False
+    last_clock: float = 0.0
+
+
+@dataclass
+class _MutableFighterWard:
+    squadron_id: int
+    team_id: int
+    relation: int
+    x: float
+    z: float
+    radius_bw: float
+    expires_clock: float
 
 
 def _clean_internal_ship_name(internal: str) -> str:
@@ -207,6 +224,8 @@ class BattleStateMachine:
         self.torpedoes: dict[str, _MutableTorpedo] = {}
         self.shells: list[_MutableShell] = []
         self.planes: dict[int, _MutablePlane] = {}
+        self._plane_tracks: dict[int, list[tuple[float, float, float]]] = {}
+        self.fighter_wards: dict[int, _MutableFighterWard] = {}
         self.kills: list[KillEvent] = []
         self.chat_messages: list[ChatMessage] = []
 
@@ -838,20 +857,37 @@ class BattleStateMachine:
                 shot_id = int(k.get("shotID", 0))
                 self.torpedoes.pop(f"{owner_id}:{shot_id}", None)
 
-    def on_plane_add(self, plane_id: int, team_id: int, pos: tuple[float, float], purpose: int) -> None:
+    def on_plane_add(
+        self,
+        plane_id: int,
+        team_id: int,
+        params_id: int,
+        pos: tuple[float, float],
+        purpose: int,
+        clock: float = 0.0,
+    ) -> None:
         rel = RELATION_ALLY if team_id == self.ally_team_id else RELATION_ENEMY
+        ac = self.store.get_aircraft(params_id)
+        icon_name = str(ac["icon_name"]) if (ac and ac.get("icon_name")) else "bomber_he"
+        is_cons = bool(ac.get("is_consumable")) if ac else False
+        px, pz = float(pos[0]), float(pos[1])
         self.planes[plane_id] = _MutablePlane(
             plane_id=plane_id,
             team_id=team_id,
             relation=rel,
-            x=float(pos[0]),
-            z=float(pos[1]),
-            prev_x=float(pos[0]),
-            prev_z=float(pos[1]),
+            x=px,
+            z=pz,
+            prev_x=px,
+            prev_z=pz,
             purpose=purpose,
+            params_id=params_id,
+            icon_name=icon_name,
+            is_consumable=is_cons,
+            last_clock=clock,
         )
+        self._plane_tracks[plane_id] = [(clock, px, pz)]
 
-    def on_plane_update(self, plane_id: int, pos: tuple[float, float]) -> None:
+    def on_plane_update(self, plane_id: int, pos: tuple[float, float], clock: float = 0.0) -> None:
         p = self.planes.get(plane_id)
         if p is None:
             return
@@ -862,9 +898,53 @@ class BattleStateMachine:
             p.yaw_rad = math.atan2(dx, dz)
         p.prev_x, p.prev_z = p.x, p.z
         p.x, p.z = nx, nz
+        p.last_clock = clock
+        track = self._plane_tracks.setdefault(plane_id, [])
+        if track and abs(clock - track[-1][0]) < 0.05:
+            track[-1] = (clock, nx, nz)
+        else:
+            track.append((clock, nx, nz))
 
-    def on_plane_remove(self, plane_id: int) -> None:
+    def on_plane_deactivate(self, plane_id: int) -> None:
+        p = self.planes.get(plane_id)
+        if p is not None and not p.is_consumable:
+            p.purpose = 1
+
+    def on_plane_remove(self, plane_id: int, clock: float = 0.0) -> None:
+        _ = clock
         self.planes.pop(plane_id, None)
+
+    def on_ward_add(self, squadron_id: int, ward_info: Any, clock: float) -> None:
+        """记录巡逻战斗机巡逻圈（wardTypes=2 且 wardShape=0 的圆形拦截区）。"""
+        if not isinstance(ward_info, dict):
+            return
+        ward_shape = int(ward_info.get("wardShape", -1))
+        ward_types = int(ward_info.get("wardTypes", 0))
+        # wardTypes=2 & wardShape=0 为航母/舰船巡逻战斗机圆形防空圈（排除烟雾矩形/间谍侦察圈）
+        if ward_shape != 0 or (ward_types & 2) == 0:
+            return
+        pos = ward_info.get("position")
+        wsize = ward_info.get("wardSize")
+        if not pos or not wsize or len(pos) < 3 or len(wsize) < 2:
+            return
+        radius_bw = float(wsize[1] or wsize[0] or 0.0)
+        if radius_bw <= 5.0:
+            return
+        team_id = int(ward_info.get("teamId", self.enemy_team_id))
+        rel = RELATION_ALLY if team_id == self.ally_team_id else RELATION_ENEMY
+        rem = float(ward_info.get("timeRemaining", 60.0) or 60.0)
+        self.fighter_wards[squadron_id] = _MutableFighterWard(
+            squadron_id=squadron_id,
+            team_id=team_id,
+            relation=rel,
+            x=float(pos[0]),
+            z=float(pos[2]),
+            radius_bw=radius_bw,
+            expires_clock=clock + max(5.0, rem) + 2.0,
+        )
+
+    def on_ward_remove(self, squadron_id: int) -> None:
+        self.fighter_wards.pop(squadron_id, None)
 
     def on_consumable_used(self, vehicle_id: int, consumable_id: int, work_time: float, clock: float) -> None:
         ship = self.ships.get(vehicle_id)
@@ -1031,7 +1111,7 @@ class BattleStateMachine:
             for z in cp_zones
         )
 
-        # 5. 飞机快照
+        # 5. 飞机快照与巡逻战斗机防空圈快照
         plane_snaps = tuple(
             PlaneState(
                 plane_id=p.plane_id,
@@ -1041,8 +1121,25 @@ class BattleStateMachine:
                 z=p.z,
                 yaw_rad=p.yaw_rad,
                 purpose=p.purpose,
+                params_id=p.params_id,
+                icon_name=p.icon_name,
+                is_consumable=p.is_consumable,
             )
             for p in self.planes.values()
+        )
+        expired_wards = [sid for sid, w in self.fighter_wards.items() if w.expires_clock < clock]
+        for sid in expired_wards:
+            self.fighter_wards.pop(sid, None)
+        ward_snaps = tuple(
+            FighterWardState(
+                squadron_id=w.squadron_id,
+                team_id=w.team_id,
+                relation=w.relation,
+                x=w.x,
+                z=w.z,
+                radius_bw=w.radius_bw,
+            )
+            for w in self.fighter_wards.values()
         )
 
         # 6. 主角伤害汇总（俄服实测：stat_type 0=对敌伤害, 2=潜在伤害, 3=侦察伤害）
@@ -1080,13 +1177,147 @@ class BattleStateMachine:
                 spotting_damage=int(round(spot_dmg)),
                 kills=self.self_kills,
             ),
+            fighter_wards=ward_snaps,
         )
         self.frames.append(frame)
         self._last_snapshot_clock = clock
 
+    @staticmethod
+    def _sample_plane_hermite(
+        ts: list[float],
+        pts: list[tuple[float, float, float]],
+        t: float,
+        is_consumable: bool,
+        fallback_x: float,
+        fallback_z: float,
+        fallback_yaw: float,
+    ) -> tuple[float, float, float]:
+        """对服务器 2.0s 离散小地图飞机采样点做时间加权三次 Hermite（Catmull-Rom）平滑插值。
+
+        消除“每 2 秒跳一次、中间 1 帧卡住不动”的 15fps 顿挫感，使 CV 中队直线突击与战斗机盘旋丝滑连贯。
+        """
+        n = len(pts)
+        if n < 2:
+            return fallback_x, fallback_z, fallback_yaw
+
+        hi = bisect_right(ts, t)
+        if hi <= 0:
+            return pts[0][1], pts[0][2], fallback_yaw
+
+        if hi >= n:
+            # 位于最后一次 2s 更新与 removeMinimapSquadron 之间的尾帧：温和按末段速度外推
+            t_prev, x_prev, z_prev = pts[-2]
+            t_last, x_last, z_last = pts[-1]
+            dt_prev = t_last - t_prev
+            dt_tail = t - t_last
+            if dt_prev > 0.1 and dt_prev <= 3.5 and dt_tail > 0.0:
+                vx = (x_last - x_prev) / dt_prev
+                vz = (z_last - z_prev) / dt_prev
+                spd = math.hypot(vx, vz)
+                if 0.1 < spd < 35.0:
+                    cap = 0.7 if is_consumable else 1.4
+                    ext = min(dt_tail, cap)
+                    return x_last + vx * ext, z_last + vz * ext, math.atan2(vx, vz)
+            return x_last, z_last, fallback_yaw
+
+        t1, x1, z1 = pts[hi - 1]
+        t2, x2, z2 = pts[hi]
+        dt = t2 - t1
+        if dt <= 1e-4:
+            return x2, z2, fallback_yaw
+
+        # 异常大跳跃/长间隔（如重新出现）不做跨图插值
+        seg_dist = math.hypot(x2 - x1, z2 - z1)
+        if dt > 5.0 or seg_dist > 180.0:
+            return x1, z1, fallback_yaw
+
+        u = max(0.0, min(1.0, (t - t1) / dt))
+        vx_seg = (x2 - x1) / dt
+        vz_seg = (z2 - z1) / dt
+
+        # 时间加权速度切线（在等速直线上精确退化为线性运动，在弯道/盘旋上平滑 C¹ 连续）
+        if hi - 2 >= 0 and (t1 - pts[hi - 2][0]) > 0.1 and (t1 - pts[hi - 2][0]) <= 3.5:
+            dt0 = t1 - pts[hi - 2][0]
+            v0x = (x1 - pts[hi - 2][1]) / dt0
+            v0z = (z1 - pts[hi - 2][2]) / dt0
+            m1x = 0.5 * (v0x + vx_seg) * dt
+            m1z = 0.5 * (v0z + vz_seg) * dt
+        else:
+            m1x = x2 - x1
+            m1z = z2 - z1
+
+        if hi + 1 < n and (pts[hi + 1][0] - t2) > 0.1 and (pts[hi + 1][0] - t2) <= 3.5:
+            dt3 = pts[hi + 1][0] - t2
+            v3x = (pts[hi + 1][1] - x2) / dt3
+            v3z = (pts[hi + 1][2] - z2) / dt3
+            m2x = 0.5 * (vx_seg + v3x) * dt
+            m2z = 0.5 * (vz_seg + v3z) * dt
+        else:
+            m2x = x2 - x1
+            m2z = z2 - z1
+
+        u2 = u * u
+        u3 = u2 * u
+        h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+        h10 = u3 - 2.0 * u2 + u
+        h01 = -2.0 * u3 + 3.0 * u2
+        h11 = u3 - u2
+
+        ix = h00 * x1 + h10 * m1x + h01 * x2 + h11 * m2x
+        iz = h00 * z1 + h10 * m1z + h01 * z2 + h11 * m2z
+
+        # 由 Hermite 一阶导数求平滑航向
+        dh00 = 6.0 * u2 - 6.0 * u
+        dh10 = 3.0 * u2 - 4.0 * u + 1.0
+        dh01 = -6.0 * u2 + 6.0 * u
+        dh11 = 3.0 * u2 - 2.0 * u
+        dx = dh00 * x1 + dh10 * m1x + dh01 * x2 + dh11 * m2x
+        dz = dh00 * z1 + dh10 * m1z + dh01 * z2 + dh11 * m2z
+        iyaw = math.atan2(dx, dz) if (abs(dx) > 1e-3 or abs(dz) > 1e-3) else fallback_yaw
+        return ix, iz, iyaw
+
+    def _apply_smooth_plane_interpolation(self) -> list[BattleFrame]:
+        """利用完整时间轴前后采样点对所有飞机轨迹进行三次样条平滑插值。"""
+        if not self.frames or not self._plane_tracks:
+            return self.frames
+
+        track_index: dict[int, tuple[list[float], list[tuple[float, float, float]]]] = {}
+        for pid, pts in self._plane_tracks.items():
+            if len(pts) >= 2:
+                track_index[pid] = ([pt[0] for pt in pts], pts)
+
+        if not track_index:
+            return self.frames
+
+        smoothed: list[BattleFrame] = []
+        for frame in self.frames:
+            if not frame.planes:
+                smoothed.append(frame)
+                continue
+            t = frame.clock
+            new_planes: list[PlaneState] = []
+            changed = False
+            for p in frame.planes:
+                entry = track_index.get(p.plane_id)
+                if entry is None:
+                    new_planes.append(p)
+                    continue
+                ts, pts = entry
+                ix, iz, iyaw = self._sample_plane_hermite(
+                    ts, pts, t, p.is_consumable, p.x, p.z, p.yaw_rad
+                )
+                if ix != p.x or iz != p.z or iyaw != p.yaw_rad:
+                    new_planes.append(replace(p, x=ix, z=iz, yaw_rad=iyaw))
+                    changed = True
+                else:
+                    new_planes.append(p)
+            smoothed.append(replace(frame, planes=tuple(new_planes)) if changed else frame)
+        return smoothed
+
     def build_timeline(self, extra_diagnostics: dict[str, Any] | None = None) -> BattleTimeline:
         if not self.frames and self.ships:
             self._emit_frame(0.0)
+        smoothed_frames = self._apply_smooth_plane_interpolation()
 
         # 推断胜负文案
         if self.win_team is not None:
@@ -1145,6 +1376,6 @@ class BattleStateMachine:
             win_team=self.win_team,
             result_zh=result_zh,
             ships_meta={vid: s.meta for vid, s in self.ships.items()},
-            frames=self.frames,
+            frames=smoothed_frames,
             diagnostics=diag,
         )

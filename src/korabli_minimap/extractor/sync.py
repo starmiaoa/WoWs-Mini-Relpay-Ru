@@ -269,7 +269,7 @@ def sync_client_data(
     vfs = KorabliVFS(client.idx_dir, client.pkg_dir, idx_filter=idx_names)
 
     entity_def_count = _extract_entity_defs(vfs, out_dir / "entity_defs")
-    gp_path, ships, projectiles, consumables = extract_game_params_catalogs(vfs, loc)
+    gp_path, ships, projectiles, consumables, aircrafts = extract_game_params_catalogs(vfs, loc)
 
     (out_dir / "ships.json").write_text(
         json.dumps(ships, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -279,6 +279,9 @@ def sync_client_data(
     )
     (out_dir / "consumables.json").write_text(
         json.dumps(consumables, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "aircrafts.json").write_text(
+        json.dumps(aircrafts, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     map_filter = {m.replace("spaces/", "").strip("/").lower() for m in map_names} if map_names else None
@@ -305,6 +308,7 @@ def sync_client_data(
         "ship_zh_hit_count": zh_hits,
         "projectile_count": len(projectiles),
         "consumable_count": len(consumables),
+        "aircraft_count": len(aircrafts),
         "map_count": map_count,
         "icon_count": icon_count,
         "font_files": font_files,

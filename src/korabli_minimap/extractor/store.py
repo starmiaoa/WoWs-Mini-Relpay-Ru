@@ -30,6 +30,7 @@ class VersionDataStore:
     projectiles: dict[str, dict[str, Any]]
     consumables: dict[str, dict[str, Any]]
     localization: dict[str, dict[str, str]]
+    aircrafts: dict[str, dict[str, Any]] = field(default_factory=dict)
     _ships_by_index: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _ships_by_internal: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
@@ -118,6 +119,15 @@ class VersionDataStore:
 
     def get_consumable(self, ability_id: int | str) -> dict[str, Any] | None:
         return self.consumables.get(str(ability_id))
+
+    def get_aircraft(self, plane_params_id: int | str) -> dict[str, Any] | None:
+        return self.aircrafts.get(str(plane_params_id))
+
+    def get_aircraft_icon_name(self, plane_params_id: int | str, fallback: str = "bomber_he") -> str:
+        ac = self.get_aircraft(plane_params_id)
+        if ac and ac.get("icon_name"):
+            return str(ac["icon_name"])
+        return fallback
 
     def get_map_dir(self, map_name: str) -> Path | None:
         clean = map_name.replace("spaces/", "").strip("/")
@@ -271,6 +281,8 @@ def load_version_store(
     projectiles = json.loads((root / "projectiles.json").read_text(encoding="utf-8"))
     consumables = json.loads((root / "consumables.json").read_text(encoding="utf-8"))
     localization = json.loads((root / "localization.json").read_text(encoding="utf-8"))
+    ac_file = root / "aircrafts.json"
+    aircrafts = json.loads(ac_file.read_text(encoding="utf-8")) if ac_file.is_file() else {}
 
     return VersionDataStore(
         version=chosen,
@@ -280,4 +292,5 @@ def load_version_store(
         projectiles=projectiles,
         consumables=consumables,
         localization=localization,
+        aircrafts=aircrafts,
     )

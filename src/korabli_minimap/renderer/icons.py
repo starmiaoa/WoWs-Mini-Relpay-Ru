@@ -70,9 +70,22 @@ class GameIconFactory:
         self._minimap_ship_base: dict[tuple[str, str, tuple[int, int, int, int], int], Image.Image] = {}
         self._minimap_ship_rot: dict[tuple[str, str, tuple[int, int, int, int], int, int], Image.Image] = {}
         self._hud_ship_cache: dict[tuple[str, tuple[int, int, int, int], int, bool], Image.Image] = {}
-        self._plane_cache: dict[tuple[tuple[int, int, int, int], bool, int, int], Image.Image] = {}
+        self._plane_base_cache: dict[tuple[str, tuple[int, int, int, int], bool, int], Image.Image] = {}
+        self._plane_cache: dict[tuple[str, tuple[int, int, int, int], bool, int, int], Image.Image] = {}
         self._frag_cache: dict[tuple[int, int], Image.Image | None] = {}
         self._counter_cache: dict[tuple[str, int], Image.Image | None] = {}
+
+    def clone(self) -> GameIconFactory:
+        """创建共享已预热不可变图标贴图、但缓存字典独立的线程安全副本。"""
+        copy_obj = GameIconFactory(icons_dir=self.icons_dir)
+        copy_obj._minimap_ship_base = dict(self._minimap_ship_base)
+        copy_obj._minimap_ship_rot = dict(self._minimap_ship_rot)
+        copy_obj._hud_ship_cache = dict(self._hud_ship_cache)
+        copy_obj._plane_base_cache = dict(self._plane_base_cache)
+        copy_obj._plane_cache = dict(self._plane_cache)
+        copy_obj._frag_cache = dict(self._frag_cache)
+        copy_obj._counter_cache = dict(self._counter_cache)
+        return copy_obj
 
     # ------------------------------------------------------------------
     # 1. 小地图舰种图标（在点 / 灭点空心 / 沉没 / 主角）
@@ -244,53 +257,73 @@ class GameIconFactory:
         return img
 
     # ------------------------------------------------------------------
-    # 3. 航空中队小图标
+    # 3. 航空中队 / 战斗机 / 水侦 / 空袭官方小地图图标（严格按官方 plane_marker.unbound）
     # ------------------------------------------------------------------
 
     def get_plane_icon(
         self,
         color: tuple[int, int, int, int],
-        yaw_rad: float,
+        yaw_rad: float = 0.0,
         returning: bool = False,
-        size: int = 16,
+        size: int = 20,
+        icon_name: str = "bomber_he",
+        rotate: bool = False,
     ) -> Image.Image:
-        deg = round((-math.degrees(yaw_rad)) / 6.0) * 6 % 360
-        adj_col = (color[0], color[1], color[2], 120 if returning else 240)
-        key = (adj_col, returning, size, deg)
+        """获取官方原版小地图飞机/战斗机/水侦/空袭图标（官方规格默认 0° 垂直显示不旋转）。"""
+        deg = (round((-math.degrees(yaw_rad)) / 6.0) * 6 % 360) if rotate else 0
+        adj_col = (color[0], color[1], color[2], 125 if returning else 245)
+        stem = icon_name or "bomber_he"
+        key = (stem, adj_col, returning, size, deg)
         cached = self._plane_cache.get(key)
         if cached is not None:
             return cached
 
-        svg_path: Path | None = None
-        if self.icons_dir and self.icons_dir.is_dir():
-            cand = self.icons_dir / "plane" / "bomber_he_ally.svg"
-            if cand.is_file():
-                svg_path = cand
+        bkey = (stem, adj_col, returning, size)
+        base = self._plane_base_cache.get(bkey)
+        if base is None:
+            svg_path: Path | None = None
+            if self.icons_dir and self.icons_dir.is_dir():
+                pdir = self.icons_dir / "plane"
+                for cand_name in (f"{stem}_ally.svg", f"{stem}_own.svg", "bomber_he_ally.svg"):
+                    cand = pdir / cand_name
+                    if cand.is_file():
+                        svg_path = cand
+                        break
 
-        if svg_path is not None:
-            base = rasterize_svg(
-                svg_path=svg_path,
-                target_w=size,
-                target_h=size,
-                tint_color=adj_col,
-                outline_color=(10, 20, 26, 160 if returning else 230),
-                supersample=4,
-            )
-        else:
-            ss = 4
-            w = h = size * ss
-            tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-            d = ImageDraw.Draw(tmp)
-            cx = w * 0.5
-            pts = [
-                (cx, h * 0.14), (w * 0.88, h * 0.62), (cx + w * 0.1, h * 0.56),
-                (cx + w * 0.14, h * 0.86), (cx, h * 0.76), (cx - w * 0.14, h * 0.86),
-                (cx - w * 0.1, h * 0.56), (w * 0.12, h * 0.62),
-            ]
-            d.polygon(pts, fill=adj_col, outline=(12, 18, 28, 180), width=max(1, ss))
-            base = tmp.resize((size, size), resample=Image.Resampling.LANCZOS)
+            if svg_path is not None:
+                base = rasterize_svg(
+                    svg_path=svg_path,
+                    target_w=size,
+                    target_h=size,
+                    tint_color=adj_col,
+                    outline_color=(10, 20, 26, 150 if returning else 230),
+                    supersample=6,
+                )
+            else:
+                ss = 4
+                w = h = size * ss
+                tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                d = ImageDraw.Draw(tmp)
+                cx = w * 0.5
+                cy = h * 0.5
+                if "consumables_fighter" in stem:
+                    r_out = w * 0.34
+                    r_in = w * 0.14
+                    d.ellipse([cx - r_out, cy - r_out, cx + r_out, cy + r_out], outline=adj_col, width=max(2, ss))
+                    d.ellipse([cx - r_in, cy - r_in, cx + r_in, cy + r_in], fill=adj_col)
+                    d.line([(cx, h * 0.08), (cx, h * 0.92)], fill=adj_col, width=max(2, ss))
+                    d.line([(w * 0.08, cy), (w * 0.92, cy)], fill=adj_col, width=max(2, ss))
+                else:
+                    pts = [
+                        (cx, h * 0.14), (w * 0.88, h * 0.62), (cx + w * 0.1, h * 0.56),
+                        (cx + w * 0.14, h * 0.86), (cx, h * 0.76), (cx - w * 0.14, h * 0.86),
+                        (cx - w * 0.1, h * 0.56), (w * 0.12, h * 0.62),
+                    ]
+                    d.polygon(pts, fill=adj_col, outline=(12, 18, 28, 180), width=max(1, ss))
+                base = tmp.resize((size, size), resample=Image.Resampling.LANCZOS)
+            self._plane_base_cache[bkey] = base
 
-        rot = base.rotate(deg, resample=Image.Resampling.BICUBIC, expand=True)
+        rot = base.rotate(deg, resample=Image.Resampling.BICUBIC, expand=True) if deg != 0 else base
         self._plane_cache[key] = rot
         return rot
 
