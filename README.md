@@ -3,20 +3,12 @@
 **简体中文** | [繁體中文](docs/README.zh-TW.md) | [Русский](docs/README.ru.md) | [English](docs/README.en.md)
 
 专门给俄服《战舰世界》（**Mir Korabley / Lesta**，`.korablireplay`）写的小地图回放渲染工具。  
-整体画面风格参考了 [WoWs-Builder-Team/minimap_renderer](https://github.com/WoWs-Builder-Team/minimap_renderer)，但只管俄服这一套协议和资源，没有亚欧美服的历史包袱，还补上了平时复盘最常用但老工具里缺的几样东西：
-
-- **地图烟雾**：完整还原每团烟的拉烟和消散过程，不会叠成一团黑。
-- **灭点船名**：敌人灭点后在小地图上保留空心图标，同时在旁边直接标出船名，复盘走位一眼就能看明白。
-- **直读汉化 mod**：自动按客户端加载顺序去读你装的汉化包（比如澪刻 LocalizedKorabli）和游戏官方图标，新船、超战都能正确显示中文名，不用手动维护船表。
-- **简洁平直血条**：侧边栏参考了 Tactical-Tech 样式，去掉了船只剪影，改成 100%-70% 绿 / 70%-30% 黄 / 30%-0% 红的连续长条，沉没的船会自动掉到列表最下面并变淡，顶栏则是整条团队总血量；小地图正下方还带局内聊天区。
-- **开箱即用的桌面界面**：自带免环境绿色版 EXE，打开就能自动找本机正式服和 PT 测试服目录，支持直接把 `.korablireplay` 拖进窗口批量出片，生成完自动按时间建文件夹并弹出来。
-- **多语言与系统主题**：界面和渲染出来的视频都支持 **简体中文 / 繁體中文 / 俄语 / 英语**，默认跟随系统语言和系统深浅色（不在四语内自动用英语）。
 
 ![渲染效果预览](docs/preview.gif)
 
 ---
 
-## 普通玩家怎么用（免安装，不用装 Python）
+## 如何使用
 
 1. 去右侧 [Releases](https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru/releases) 下载 `WoWs-Mini-Relpay-Ru-win64.zip`。
 2. **先解压**到任意文件夹，然后双击 `WoWs-Mini-Relpay-Ru.exe`。
