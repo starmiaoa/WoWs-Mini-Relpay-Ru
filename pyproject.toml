@@ -4,16 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wows-mini-relpay-ru"
-version = "0.2.0"
+version = "0.2.1"
 description = "俄服《战舰世界》（Mir Korabley / Lesta）小地图回放扁平化渲染工具，支持烟雾渲染、灭点船名显示、mod 汉化同步与多版本长期维护"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pillow>=11.0.0",
-    "numpy>=2.0.0",
     "pycryptodome>=3.20.0",
     "msgpack>=1.1.0",
-    "imageio>=2.36.0",
     "imageio-ffmpeg>=0.5.1",
     "pyside6-essentials>=6.12.0",
     "zhconv>=1.4.3",
@@ -22,7 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
-    "pyinstaller>=6.11.0",
+    "nuitka>=2.6.0",
+    "ordered-set>=4.1.0",
+    "zstandard>=0.23.0",
 ]
 
 [project.scripts]

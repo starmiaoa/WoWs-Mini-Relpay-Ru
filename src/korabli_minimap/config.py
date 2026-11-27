@@ -3,20 +3,98 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import sys
 
 
+def is_compiled_app() -> bool:
+    """判断当前是否运行于编译/冻结后的独立 EXE（兼容 Nuitka 与 PyInstaller）。"""
+    return bool(getattr(sys, "frozen", False)) or ("__compiled__" in globals())
+
+
 def get_app_root() -> Path:
-    """返回应用根目录：PyInstaller 打包后为 EXE 所在目录，开发模式为项目根目录。"""
-    if getattr(sys, "frozen", False):
+    """返回应用根目录：Nuitka/PyInstaller 独立版为 EXE 所在目录，开发模式为项目根目录。"""
+    if is_compiled_app():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
 
 
+def is_installed_app() -> bool:
+    """判断当前是否为安装包模式（存在 Inno Setup 卸载程序 unins000.exe）。"""
+    if not is_compiled_app():
+        return False
+    root = get_app_root()
+    return (root / "unins000.exe").is_file() or (root / "unins001.exe").is_file()
+
+
+def _is_dir_writable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".wows_write_probe_{os.getpid()}"
+        probe.write_bytes(b"ok")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def get_writable_storage_root() -> Path:
+    """返回可写数据根目录：便携版与可写安装目录优先与程序同级；安装到只读 Program Files 时自动回退 LocalAppData。"""
+    root = get_app_root()
+    if not is_compiled_app() or _is_dir_writable(root):
+        return root
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        return Path(local_app) / "WoWs-Mini-Relpay-Ru"
+    return Path.home() / "WoWs-Mini-Relpay-Ru"
+
+
 DEFAULT_GAME_DIR = Path(r"D:\Games\Korabli")
-DEFAULT_DATA_DIR = get_app_root() / "data"
-DEFAULT_OUTPUT_DIR = get_app_root() / "output"
+DEFAULT_DATA_DIR = get_writable_storage_root() / "data"
+DEFAULT_OUTPUT_DIR = get_writable_storage_root() / "output"
+
+# 播放倍速与帧率基准（对齐上游 WoWs-Builder-Team/minimap_renderer 默认 20× 战局倍速）
+BASE_PLAYBACK_SPEED: float = 20.0
+DEFAULT_FPS: int = 25
+DEFAULT_SPEED_MULTIPLIER: float = 1.0
+MIN_SPEED_MULTIPLIER: float = 0.5   # 慢 2 倍 (-2x -> 10× 战局速)
+MAX_SPEED_MULTIPLIER: float = 4.0   # 快 4 倍 (+4x -> 80× 战局速)
+
+# 仅允许 16:9 常见标准分辨率（720p / 1K / 2K / 4K）
+ALLOWED_RESOLUTIONS: tuple[tuple[str, int, int], ...] = (
+    ("res_720p", 1280, 720),
+    ("res_1k", 1920, 1080),
+    ("res_2k", 2560, 1440),
+    ("res_4k", 3840, 2160),
+)
+
+
+def clamp_speed_multiplier(multiplier: float) -> float:
+    """将播放倍率限制在合法范围 [0.5, 4.0]（相对原项目默认 20× 基准：慢 2 倍到快 4 倍）。"""
+    try:
+        val = float(multiplier)
+    except (TypeError, ValueError):
+        val = DEFAULT_SPEED_MULTIPLIER
+    if val != val:  # NaN guard
+        val = DEFAULT_SPEED_MULTIPLIER
+    return round(max(MIN_SPEED_MULTIPLIER, min(MAX_SPEED_MULTIPLIER, val)), 2)
+
+
+def snap_to_allowed_resolution(width: int, height: int) -> tuple[int, int]:
+    """将分辨率严格对齐至允许的 4 档 16:9 标准分辨率（720p / 1K / 2K / 4K）。"""
+    try:
+        w = int(width)
+        h = int(height)
+    except (TypeError, ValueError):
+        return (1920, 1080)
+    for _key, pw, ph in ALLOWED_RESOLUTIONS:
+        if w == pw and h == ph:
+            return (pw, ph)
+    if w <= 0 or h <= 0:
+        return (1920, 1080)
+    _, best_w, best_h = min(ALLOWED_RESOLUTIONS, key=lambda item: abs(item[1] - w) + abs(item[2] - h))
+    return (best_w, best_h)
 
 
 @dataclass(frozen=True)
@@ -103,13 +181,14 @@ class ThemeColors:
 class RenderConfig:
     """渲染输出参数与功能开关。"""
 
-    fps: int = 30                      # 默认 30fps = 30 倍速（1K 1920x1080 高清输出）
-    output_width: int = 1920           # 输出视频宽度（默认 1K 1920）
-    output_height: int = 1080          # 输出视频高度（默认 1K 1080）
-    language: str = "zh_CN"            # 渲染器界面语言: zh_CN / zh_TW / ru / en
-    encoder: str = "auto"              # 视频编码器: auto (优先 NVENC/AMF/QSV，回退 libx264) | x264 | nvenc | amf | qsv
-    render_workers: int = 0            # 并发渲染线程数: 0 = 自动按 CPU 核心数自适应
-    seconds_per_frame: float = 1.0
+    fps: int = DEFAULT_FPS                                  # 默认 25fps（与倍速解耦，选 25/30/60 仅影响流畅度）
+    speed_multiplier: float = DEFAULT_SPEED_MULTIPLIER      # 相对原项目默认 20× 的倍率（0.5=慢2倍 ~ 4.0=快4倍）
+    output_width: int = 1920                                # 输出视频宽度（仅 720p/1K/2K/4K 16:9 档位，默认 1K）
+    output_height: int = 1080                               # 输出视频高度（仅 720p/1K/2K/4K 16:9 档位，默认 1K）
+    language: str = "zh_CN"                                 # 渲染器界面语言: zh_CN / zh_TW / ru / en
+    encoder: str = "auto"                                   # 视频编码器: auto (优先 NVENC/AMF/QSV，回退 libx264) | x264 | nvenc | amf | qsv
+    render_workers: int = 0                                 # 并发渲染线程数: 0 = 自动按 CPU 核心数自适应
+    seconds_per_frame: float | None = None                  # None 时按 (20.0 * speed_multiplier) / fps 自动计算
     end_banner_seconds: float = 2.5
 
     # 核心开关
@@ -129,10 +208,20 @@ class RenderConfig:
     font_path: Path | None = None
     bold_font_path: Path | None = None
 
+    def resolved_speed_multiplier(self) -> float:
+        """返回夹紧在 [0.5, 4.0] 范围内的播放倍率。"""
+        return clamp_speed_multiplier(self.speed_multiplier)
+
+    def effective_battle_speed(self) -> float:
+        """返回实际战局推进倍速（每秒视频推进的战局秒数，默认 20×）。"""
+        return BASE_PLAYBACK_SPEED * self.resolved_speed_multiplier()
+
+    def resolved_seconds_per_frame(self) -> float:
+        """返回每输出 1 帧视频对应的战局推进秒数（实现倍速与帧率解耦）。"""
+        if self.seconds_per_frame is not None and self.seconds_per_frame > 0:
+            return float(self.seconds_per_frame)
+        return self.effective_battle_speed() / max(1, int(self.fps))
+
     def resolved_output_size(self) -> tuple[int, int]:
-        """返回偶数对齐的合法输出分辨率（兼容 H.264 yuv420p）。"""
-        w = max(320, int(self.output_width))
-        h = max(240, int(self.output_height))
-        w = w - (w % 2)
-        h = h - (h % 2)
-        return w, h
+        """返回严格对齐 16:9 标准四档（720p / 1K / 2K / 4K）的合法输出分辨率。"""
+        return snap_to_allowed_resolution(self.output_width, self.output_height)

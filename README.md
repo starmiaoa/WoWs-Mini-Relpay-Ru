@@ -10,24 +10,26 @@
 
 ## 如何使用
 
-1. 去右侧 [Releases](https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru/releases) 下载 `WoWs-Mini-Relpay-Ru-win64.zip`。
-2. **先解压**到任意文件夹，然后双击 `WoWs-Mini-Relpay-Ru.exe`。
-3. 打开后会自动找到你装的俄服正式服 / PT 服并列出 `replays` 里的 `.korablireplay`（如果没有找到，点一下右上角「选择目录」自己指一下就行）。
-4. 勾选你想生成的对局，或者把 `.korablireplay` 文件直接拖进窗口里。
-5. 右边选好分辨率（默认 `1920×1080`）和帧率（默认 `30fps`），点 **「开始生成」**。
-6. 等进度条走完，程序会自动打开这次按时间建好的输出文件夹，视频都在里面。
+1. 去右侧 [Releases](https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru/releases) 下载适合自己的 Windows 版本（提供三种选择）：
+   - **Windows 安装包（推荐）**：`WoWs-Mini-Relpay-Ru-Setup-win64.exe`，一路下一步即可完成安装，自动创建开始菜单与桌面快捷方式。
+   - **免安装绿色便携包**：`WoWs-Mini-Relpay-Ru-win64.7z` 或 `WoWs-Mini-Relpay-Ru-win64.zip`，**先解压**到任意文件夹，再双击 `WoWs-Mini-Relpay-Ru.exe`。
+2. 打开后会自动找到你装的俄服正式服 / PT 服并列出 `replays` 里的 `.korablireplay`（如果没有找到，点一下右上角「选择目录」自己指一下就行）。
+3. 勾选你想生成的对局，或者把 `.korablireplay` 文件直接拖进窗口里。
+4. 右边选好 16:9 标准分辨率（`720p` / 默认 `1K 1920×1080` / `2K` / `4K`）和帧率（默认 **`25fps`**，可选 `25` / `30` / `60` fps；帧率与倍速解耦，调高只提升画面流畅度，不会加快战局进度），点 **「开始生成」**。
+5. 等进度条走完，程序会自动打开这次按时间建好的输出文件夹，视频都在里面。
 
 > 首次打开时程序会在后台顺手从你本地游戏目录里提取一次地图、图标和汉化词库（大概几秒钟），以后就不用再等了。  
-> 想改图层开关、导出关键帧、换主题或语言，点顶部的 **「高级」** 或 **「设置」** 标签页就行。
+> 默认播放速度对齐原项目 `20×` 战局倍速；如果想调整倍速（支持 `0.5×` 慢 2 倍到 `4×` 快 4 倍），或者改图层开关、导出关键帧、换主题和语言，点顶部的 **「高级」** 或 **「设置」** 标签页就行。
 
 ---
 
-## 游戏更新或者汉化 mod 更新了怎么办？
+## 游戏、汉化 mod 或软件更新了怎么办？
 
-不用等工具发新版，大多数更新你本地就能直接同步：
+不用折腾重装，大部分更新在软件里点一下就能搞定：
 
 - **游戏大版本更新后**：打开软件 → 切到 **「设置」** → 点 **「重新同步当前客户端数据」**（几秒完成）。
 - **只是更新了汉化 mod 船名**：切到 **「设置」** → 点 **「仅更新汉化词库」**（1 秒完成）。
+- **软件本身有新版本时**：切到 **「关于」** → 点 **「检查更新」**，检测到新版后直接点 **「快速拉取更新」** 即可自动下载并应用最新 GitHub Release（保留本地 `data/` 缓存与 `output/` 视频）。
 
 如果是非常少见的大改导致协议解析报错，可以参考 [UPDATING.md](UPDATING.md) 里的排查说明，或者直接提 Issue 并附上一局新版 `.korablireplay`。
 
@@ -50,12 +52,12 @@ uv sync --extra dev
 
 # 3. 命令行直接渲染单个回放
 .\.venv\Scripts\korabli-minimap.exe render "D:\Games\Korabli\replays\xxx.korablireplay" `
-  -o "output\battle.mp4" --resolution 1920x1080 --fps 30 --lang zh_CN
+  -o "output\battle.mp4" --resolution 1920x1080 --fps 25 --speed 1.0 --lang zh_CN
 
 # 4. 只解析查看战报信息（不出视频）
 .\.venv\Scripts\korabli-minimap.exe inspect "D:\Games\Korabli\replays\xxx.korablireplay"
 
-# 5. 打包免环境绿色版 EXE 与发布压缩包
+# 5. 打包免环境绿色版 EXE 与发布压缩包（ZIP / 7z）
 .\.venv\Scripts\python.exe scripts\build_release.py
 
 # 6. 运行自动化测试

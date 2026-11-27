@@ -246,3 +246,137 @@ def test_custom_resolution_and_progress_callback_video_export(tmp_path: Path) ->
     gen.close()
     assert meta["size"] == (1280, 720)
     assert abs(float(meta["fps"]) - 60.0) < 0.5
+
+
+def test_version_single_source_lite_store_and_no_numpy(tmp_path: Path) -> None:
+    import json
+    import sys
+    import tomllib
+
+    import korabli_minimap
+    from korabli_minimap.config import is_compiled_app
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    py_ver = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert korabli_minimap.__version__ == py_ver
+    assert is_compiled_app() is False
+
+    # 校验 lite=True 模式跳过大体积弹药/消耗品/飞机表，保持 GUI 空闲低内存
+    ver_dir = tmp_path / "versions" / "26.11.1"
+    ver_dir.mkdir(parents=True)
+    (ver_dir / "manifest.json").write_text(json.dumps({"version": "26.11.1"}), encoding="utf-8")
+    (ver_dir / "ships.json").write_text(json.dumps({"1": {"zh_name": "测试舰"}}), encoding="utf-8")
+    (ver_dir / "localization.json").write_text(json.dumps({"maps_zh": {"M1": "测试图"}}), encoding="utf-8")
+    (ver_dir / "projectiles.json").write_text(json.dumps({"99": {"name": "HE"}}), encoding="utf-8")
+    (ver_dir / "consumables.json").write_text(json.dumps({"88": {"name": "Radar"}}), encoding="utf-8")
+    (ver_dir / "aircrafts.json").write_text(json.dumps({"77": {"species": "Fighter"}}), encoding="utf-8")
+
+    lite_store = load_version_store(data_dir=tmp_path, lite=True)
+    assert "1" in lite_store.ships
+    assert lite_store.projectiles == {}
+    assert lite_store.consumables == {}
+    assert lite_store.aircrafts == {}
+
+    full_store = load_version_store(data_dir=tmp_path, lite=False)
+    assert "99" in full_store.projectiles
+    assert "88" in full_store.consumables
+    assert "77" in full_store.aircrafts
+
+    # 长期内存红线：严禁重新引入 numpy（单 import 即占 ~366 MB OpenBLAS 提交内存）
+    assert "numpy" not in sys.modules
+
+
+def test_speed_multiplier_decoupled_fps_and_strict_16_9_resolutions(tmp_path: Path) -> None:
+    import argparse
+    import pytest
+
+    from korabli_minimap.cli import _parse_resolution, _parse_speed
+    from korabli_minimap.config import (
+        ALLOWED_RESOLUTIONS,
+        BASE_PLAYBACK_SPEED,
+        DEFAULT_FPS,
+        DEFAULT_SPEED_MULTIPLIER,
+        clamp_speed_multiplier,
+        snap_to_allowed_resolution,
+    )
+    from korabli_minimap.domain.battle_state import BattleStateMachine
+
+    assert BASE_PLAYBACK_SPEED == 20.0
+    assert DEFAULT_FPS == 25
+    assert DEFAULT_SPEED_MULTIPLIER == 1.0
+    assert [(w, h) for _k, w, h in ALLOWED_RESOLUTIONS] == [
+        (1280, 720),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ]
+
+    # 倍率严格限制在 0.5x (慢2倍) ~ 4.0x (快4倍)
+    assert clamp_speed_multiplier(0.1) == 0.5
+    assert clamp_speed_multiplier(0.5) == 0.5
+    assert clamp_speed_multiplier(1.0) == 1.0
+    assert clamp_speed_multiplier(4.0) == 4.0
+    assert clamp_speed_multiplier(9.9) == 4.0
+
+    # 倍率与帧率解耦验证
+    cfg_default = RenderConfig()
+    assert cfg_default.fps == 25
+    assert cfg_default.effective_battle_speed() == 20.0
+    assert abs(cfg_default.resolved_seconds_per_frame() - 0.8) < 1e-6
+
+    cfg_60 = RenderConfig(fps=60, speed_multiplier=1.0)
+    assert cfg_60.effective_battle_speed() == 20.0
+    assert abs(cfg_60.resolved_seconds_per_frame() - (20.0 / 60.0)) < 1e-6
+
+    cfg_slow = RenderConfig(fps=25, speed_multiplier=0.5)
+    assert cfg_slow.effective_battle_speed() == 10.0
+    assert abs(cfg_slow.resolved_seconds_per_frame() - 0.4) < 1e-6
+
+    cfg_fast = RenderConfig(fps=25, speed_multiplier=4.0)
+    assert cfg_fast.effective_battle_speed() == 80.0
+    assert abs(cfg_fast.resolved_seconds_per_frame() - 3.2) < 1e-6
+
+    # 分辨率严格对齐 16:9 四档
+    assert snap_to_allowed_resolution(1280, 720) == (1280, 720)
+    assert snap_to_allowed_resolution(1920, 1080) == (1920, 1080)
+    assert snap_to_allowed_resolution(2560, 1440) == (2560, 1440)
+    assert snap_to_allowed_resolution(3840, 2160) == (3840, 2160)
+    assert snap_to_allowed_resolution(1920, 1200) == (1920, 1080)
+    assert RenderConfig(output_width=2560, output_height=1600).resolved_output_size() == (2560, 1440)
+
+    # CLI 参数校验：拒绝非 16:9 分辨率与越界倍率
+    assert _parse_resolution("720p") == (1280, 720)
+    assert _parse_resolution("1k") == (1920, 1080)
+    assert _parse_resolution("2K") == (2560, 1440)
+    assert _parse_resolution("4k") == (3840, 2160)
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_resolution("1920x1200")
+    assert _parse_speed("0.5") == 0.5
+    assert _parse_speed("4.0") == 4.0
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_speed("0.25")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_speed("5.0")
+
+    # 均匀亚秒采样与在点舰船平滑插值校验（0.5s/frame）
+    store = _dummy_store(tmp_path)
+    sm = BattleStateMachine("synthetic.korablireplay", {"mapName": "47_Sleeping_Giant"}, store, seconds_per_frame=0.5)
+    sm.register_roster(
+        [
+            {"vehicle_id": 100, "player_name": "Hero", "team_id": 0, "ship_params_id": 4073633616, "max_hp": 83450},
+        ]
+    )
+    sm.set_player_vehicle(100)
+    sm.on_vehicle_position(100, 0.0, 0.0, 0.0, clock=10.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1200}, clock=10.0, time_left_changed=True)
+    sm.on_clock_tick(10.5)
+    sm.on_vehicle_position(100, 20.0, 0.0, 0.0, clock=11.0)
+    sm.on_clock_tick(11.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1199}, clock=11.0, time_left_changed=True)
+    tl = sm.build_timeline()
+    assert len(tl.frames) == 3
+    # 中间帧 clock=10.5 应插值至 x=10.0（介于 0.0 与 20.0 之间）
+    assert abs(tl.frames[1].clock - 10.5) < 1e-6
+    assert abs(tl.frames[1].ships[100].x - 10.0) < 1e-3
+
+

@@ -168,7 +168,8 @@ def test_hp_bar_three_tier_color_thresholds(tmp_path: Path) -> None:
         "playerName": "tester",
     }
     cfg = RenderConfig()
-    assert cfg.fps == 30
+    assert cfg.fps == 25
+    assert cfg.effective_battle_speed() == 20.0
     assert (CANVAS_W, CANVAS_H) == (1920, 1080)
     sm = BattleStateMachine("dummy.korablireplay", meta, store)
     ren = MinimapFrameRenderer(sm.build_timeline(), store, cfg)
@@ -237,7 +238,6 @@ def test_official_korabli_icons_rasterization() -> None:
 
 
 def test_worker_clone_parity_and_encoder_scale_filter(tmp_path: Path) -> None:
-    import numpy as np
     from korabli_minimap.renderer.video import (
         _build_ffmpeg_scale_filter,
         resolve_video_encoder,
@@ -278,9 +278,9 @@ def test_worker_clone_parity_and_encoder_scale_filter(tmp_path: Path) -> None:
 
     main_ren = MinimapFrameRenderer(tl, store, RenderConfig())
     clone_ren = main_ren.clone_for_worker()
-    a1 = np.asarray(main_ren.render_frame(tl.frames[0]), dtype=np.uint8)
-    a2 = np.asarray(clone_ren.render_frame(tl.frames[0]), dtype=np.uint8)
-    assert np.array_equal(a1, a2)
+    a1 = main_ren.render_frame(tl.frames[0]).tobytes()
+    a2 = clone_ren.render_frame(tl.frames[0]).tobytes()
+    assert a1 == a2
 
 
 def test_plane_icon_classification_ward_and_hermite_smoothing(tmp_path: Path) -> None:
@@ -338,3 +338,50 @@ def test_plane_icon_classification_ward_and_hermite_smoothing(tmp_path: Path) ->
     ren = MinimapFrameRenderer(tl, store, RenderConfig())
     img = ren.render_frame(tl.frames[1])
     assert img.size == (CANVAS_W, CANVAS_H)
+
+
+def test_minimap_ship_labels_always_anchored_below_icon(tmp_path: Path) -> None:
+    """两艘紧邻的战舰同屏时，双方船名均必须锚定在各自图标正下方，绝不允许向上漂移到图标上方。"""
+    from korabli_minimap.renderer.layers import MINIMAP_X, MINIMAP_Y
+
+    store = _make_dummy_store(tmp_path)
+    meta = {
+        "clientVersionFromExe": "26,11,1,8871067",
+        "mapName": "spaces/47_Sleeping_Giant",
+        "gameType": "RandomBattle",
+        "scenario": "domination_4point",
+        "duration": 1200,
+        "playerName": "hero",
+    }
+    sm = BattleStateMachine("test.korablireplay", meta, store)
+    sm.register_roster(
+        [
+            {"vehicle_id": 1001, "player_name": "hero", "team_id": 0, "ship_params_id": 111, "max_hp": 80000},
+            {"vehicle_id": 1002, "player_name": "foe", "team_id": 1, "ship_params_id": 222, "max_hp": 25000},
+        ]
+    )
+    sm.set_player_vehicle(1001)
+    # 两船极近距离相邻（在旧版防重叠逻辑中必然导致第 2 艘船名跳到图标上方）
+    sm.on_vehicle_create(1001, 0.0, 0.0, 0.0, {"health": 80000, "maxHealth": 80000, "isAlive": True}, 1.0)
+    sm.on_vehicle_create(1002, 5.0, -5.0, 0.0, {"health": 25000, "maxHealth": 25000, "isAlive": True}, 1.0)
+    sm.on_battle_logic_sync({"battleStage": 0, "timeLeft": 1200}, 2.0, time_left_changed=True)
+    tl = sm.build_timeline()
+
+    ren_no_lbl = MinimapFrameRenderer(tl, store, RenderConfig(show_spotted_names=False, show_unspotted_names=False))
+    ren_with_lbl = MinimapFrameRenderer(tl, store, RenderConfig(show_spotted_names=True, show_unspotted_names=True))
+    img_no = ren_no_lbl.render_frame(tl.frames[0])
+    img_yes = ren_with_lbl.render_frame(tl.frames[0])
+
+    # 在小地图内检查像素差异：所有新增的船名字素 y 坐标必须严格位于两船图标中心下方（py > icon_py + 8）
+    px1, py1 = ren_with_lbl.proj.world_to_pixel(0.0, 0.0)
+    px2, py2 = ren_with_lbl.proj.world_to_pixel(5.0, -5.0)
+    top_ship_py = min(py1, py2)
+
+    diff_ys: list[int] = []
+    for y in range(int(top_ship_py - 45), int(max(py1, py2) + 55)):
+        for x in range(int(min(px1, px2) - 80), int(max(px1, px2) + 80)):
+            if img_no.getpixel((MINIMAP_X + x, MINIMAP_Y + y)) != img_yes.getpixel((MINIMAP_X + x, MINIMAP_Y + y)):
+                diff_ys.append(y)
+    assert diff_ys, "预期应绘制出船名像素差异"
+    assert min(diff_ys) >= int(top_ship_py) + 10, f"检测到船名漂移到了图标上方: min_y={min(diff_ys)}, ship_py={top_ship_py}"
+

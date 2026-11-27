@@ -8,7 +8,16 @@ import sys
 import time
 from pathlib import Path
 
-from .config import DEFAULT_DATA_DIR, DEFAULT_GAME_DIR, RenderConfig
+from .config import (
+    ALLOWED_RESOLUTIONS,
+    DEFAULT_DATA_DIR,
+    DEFAULT_FPS,
+    DEFAULT_GAME_DIR,
+    DEFAULT_SPEED_MULTIPLIER,
+    MAX_SPEED_MULTIPLIER,
+    MIN_SPEED_MULTIPLIER,
+    RenderConfig,
+)
 from .extractor import list_synced_versions, sync_client_data
 from .parser import parse_replay
 from .renderer import render_timeline_to_video
@@ -56,22 +65,50 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+_RESOLUTION_ALIASES: dict[str, tuple[int, int]] = {
+    "720p": (1280, 720),
+    "1280x720": (1280, 720),
+    "1k": (1920, 1080),
+    "1080p": (1920, 1080),
+    "1920x1080": (1920, 1080),
+    "2k": (2560, 1440),
+    "1440p": (2560, 1440),
+    "2560x1440": (2560, 1440),
+    "4k": (3840, 2160),
+    "2160p": (3840, 2160),
+    "3840x2160": (3840, 2160),
+}
+
+
 def _parse_resolution(res_str: str) -> tuple[int, int]:
-    parts = res_str.lower().replace("×", "x").split("x")
-    if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
-        raise argparse.ArgumentTypeError(f"分辨率格式应为 宽x高（如 1920x1080），收到: {res_str}")
-    return int(parts[0].strip()), int(parts[1].strip())
+    key = res_str.strip().lower().replace("×", "x").replace(" ", "")
+    if key in _RESOLUTION_ALIASES:
+        return _RESOLUTION_ALIASES[key]
+    allowed_txt = " / ".join(f"{w}x{h}" for _k, w, h in ALLOWED_RESOLUTIONS)
+    raise argparse.ArgumentTypeError(
+        f"仅支持 16:9 常见分辨率（720p / 1K / 2K / 4K：{allowed_txt}），收到: {res_str}"
+    )
+
+
+def _parse_speed(speed_str: str) -> float:
+    try:
+        val = float(speed_str)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"播放倍率必须是数字（{MIN_SPEED_MULTIPLIER}~{MAX_SPEED_MULTIPLIER}），收到: {speed_str}") from exc
+    if val < MIN_SPEED_MULTIPLIER or val > MAX_SPEED_MULTIPLIER:
+        raise argparse.ArgumentTypeError(
+            f"播放倍率仅允许 {MIN_SPEED_MULTIPLIER}x（慢2倍）至 {MAX_SPEED_MULTIPLIER}x（快4倍），收到: {val}"
+        )
+    return round(val, 2)
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
     t0 = time.perf_counter()
-    tl, store = parse_replay(args.replay, data_dir=args.data_dir)
-    t1 = time.perf_counter()
-
     out_w, out_h = _parse_resolution(args.resolution)
     out_mp4 = Path(args.output) if args.output else Path("output") / (Path(args.replay).stem + ".mp4")
     cfg = RenderConfig(
         fps=args.fps,
+        speed_multiplier=args.speed,
         output_width=out_w,
         output_height=out_h,
         language=args.lang,
@@ -84,6 +121,12 @@ def _cmd_render(args: argparse.Namespace) -> int:
         show_planes=not args.no_planes,
         show_chat=not args.no_chat,
     )
+    tl, store = parse_replay(
+        args.replay,
+        data_dir=args.data_dir,
+        seconds_per_frame=cfg.resolved_seconds_per_frame(),
+    )
+    t1 = time.perf_counter()
     res = render_timeline_to_video(
         timeline=tl,
         store=store,
@@ -94,7 +137,10 @@ def _cmd_render(args: argparse.Namespace) -> int:
     )
     t2 = time.perf_counter()
     print(f"[渲染完成] 解析 {t1 - t0:.2f}s | 渲染+编码 {t2 - t1:.2f}s | 总耗时 {t2 - t0:.2f}s")
-    print(f"  输出视频 : {res.video_path} ({res.width}x{res.height}, {res.total_frames} 帧 @ {res.fps}fps, {res.encoder_used})")
+    print(
+        f"  输出视频 : {res.video_path} ({res.width}x{res.height}, {res.total_frames} 帧 @ {res.fps}fps, "
+        f"{cfg.resolved_speed_multiplier():.2g}x / {cfg.effective_battle_speed():.0f}x 战局速, {res.encoder_used})"
+    )
     print(f"  地图/模式: {tl.map_zh_name} · {tl.battle_type_zh} ({tl.result_zh})")
     if res.keyframe_paths:
         print(f"  关键帧图 : 共导出 {len(res.keyframe_paths)} 张")
@@ -156,8 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ren = sub.add_parser("render", help="将 .korablireplay 渲染为扁平化 H.264 MP4 小地图回放视频")
     p_ren.add_argument("replay", type=Path, help=".korablireplay 文件路径")
     p_ren.add_argument("-o", "--output", type=Path, default=None, help="输出 MP4 文件路径")
-    p_ren.add_argument("--fps", type=int, default=30, help="输出帧率 / 播放倍速（默认 30，即 30 倍速）")
-    p_ren.add_argument("--resolution", type=str, default="1920x1080", help="输出分辨率（宽x高，默认 1920x1080）")
+    p_ren.add_argument("--fps", type=int, default=DEFAULT_FPS, help="输出视频帧率（默认 25fps，与倍速解耦，调高仅提升流畅度）")
+    p_ren.add_argument("--speed", type=_parse_speed, default=DEFAULT_SPEED_MULTIPLIER, help="播放倍率（0.5=慢2倍 ~ 4.0=快4倍，默认 1.0 对齐原项目 20× 战局速）")
+    p_ren.add_argument("--resolution", type=str, default="1920x1080", help="输出分辨率（仅支持 720p / 1K / 2K / 4K，默认 1920x1080）")
     p_ren.add_argument("--lang", type=str, default="auto", choices=["auto", "zh_CN", "zh_TW", "ru", "en"], help="渲染画面语言（auto 跟随系统，或指定 zh_CN / zh_TW / ru / en）")
     p_ren.add_argument("--encoder", type=str, default="auto", choices=["auto", "nvenc", "amf", "qsv", "x264"], help="视频编码器（默认 auto 自动优先 GPU 硬件编码，失败回退 x264）")
     p_ren.add_argument("--keyframes-dir", type=Path, default=None, help="同时导出代表性关键帧 PNG 到此目录")

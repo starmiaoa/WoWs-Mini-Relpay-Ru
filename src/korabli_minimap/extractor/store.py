@@ -248,8 +248,12 @@ def list_synced_versions(data_dir: Path | str = DEFAULT_DATA_DIR) -> list[str]:
 def load_version_store(
     replay_version: str | None = None,
     data_dir: Path | str = DEFAULT_DATA_DIR,
+    lite: bool = False,
 ) -> VersionDataStore:
-    """根据回放版本号加载精确匹配或最近邻的已同步俄服版本数据。"""
+    """根据回放版本号加载精确匹配或最近邻的已同步俄服版本数据。
+
+    `lite=True` 供 GUI 列表常驻使用，仅加载舰船与地图名称表，跳过弹药/消耗品/飞机大表以降低常驻内存。
+    """
     versions_dir = Path(data_dir) / "versions"
     available = list_synced_versions(data_dir)
     if not available:
@@ -278,11 +282,16 @@ def load_version_store(
     root = versions_dir / chosen
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     ships = json.loads((root / "ships.json").read_text(encoding="utf-8"))
-    projectiles = json.loads((root / "projectiles.json").read_text(encoding="utf-8"))
-    consumables = json.loads((root / "consumables.json").read_text(encoding="utf-8"))
     localization = json.loads((root / "localization.json").read_text(encoding="utf-8"))
-    ac_file = root / "aircrafts.json"
-    aircrafts = json.loads(ac_file.read_text(encoding="utf-8")) if ac_file.is_file() else {}
+    if lite:
+        projectiles: dict[str, dict[str, Any]] = {}
+        consumables: dict[str, dict[str, Any]] = {}
+        aircrafts: dict[str, dict[str, Any]] = {}
+    else:
+        projectiles = json.loads((root / "projectiles.json").read_text(encoding="utf-8"))
+        consumables = json.loads((root / "consumables.json").read_text(encoding="utf-8"))
+        ac_file = root / "aircrafts.json"
+        aircrafts = json.loads(ac_file.read_text(encoding="utf-8")) if ac_file.is_file() else {}
 
     return VersionDataStore(
         version=chosen,

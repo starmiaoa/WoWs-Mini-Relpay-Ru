@@ -1,4 +1,4 @@
-"""PyInstaller 独立 EXE 启动入口（默认启动图形界面，传入 --cli 可调用命令行模式）。"""
+"""Nuitka 独立 EXE 启动入口（默认启动图形界面，传入 --cli 可调用命令行模式）。"""
 
 from __future__ import annotations
 

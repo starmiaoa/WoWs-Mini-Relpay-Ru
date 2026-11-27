@@ -22,7 +22,6 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from ..config import RenderConfig
@@ -227,10 +226,10 @@ class MinimapFrameRenderer:
                 key=lambda m: (SPECIES_ORDER.get(m.species, 9), -m.level, m.zh_name),
             )
 
-            self.base_minimap = self._build_base_minimap()
-            self.base_canvas = self._build_base_canvas()
-            self._base_minimap_rgb = self.base_minimap.convert("RGB")
-            self._base_canvas_rgb = self.base_canvas.convert("RGB")
+            self._base_minimap_rgb = self._build_base_minimap().convert("RGB")
+            self._base_canvas_rgb = self._build_base_canvas().convert("RGB")
+            self.base_minimap = self._base_minimap_rgb
+            self.base_canvas = self._base_canvas_rgb
 
             # 预裁剪各独立面板的不透明底图（RGB，避免每帧整画布合成与转换）
             self._ally_ear_bg_rgb = self._base_canvas_rgb.crop((LEFT_X, EARS_Y, LEFT_X + LEFT_W, EARS_Y + EARS_H))
@@ -701,12 +700,12 @@ class MinimapFrameRenderer:
         """渲染单帧并返回独立安全的 RGB PIL Image 副本。"""
         return self._render_into_buf(frame, end_banner_alpha=end_banner_alpha).copy()
 
-    def render_frame_rgb_array(
+    def render_frame_rgb_bytes(
         self, frame: BattleFrame, end_banner_alpha: float = 0.0
-    ) -> np.ndarray:
-        """高速视频流接口：就地增量更新持久画布，直接以连续 uint8 NumPy 数组返回 RGB24 帧（零多余拷贝）。"""
+    ) -> bytes:
+        """高速视频流接口：就地增量更新持久画布，零 NumPy 依赖直接输出紧凑 RGB24 原始字节。"""
         buf = self._render_into_buf(frame, end_banner_alpha=end_banner_alpha)
-        return np.array(buf, dtype=np.uint8, copy=True)
+        return buf.tobytes("raw", "RGB")
 
     # =========================================================================
     # 小地图各图层
@@ -938,7 +937,7 @@ class MinimapFrameRenderer:
             stroke_width=2,
             stroke_fill=stroke_col,
         )
-        res = (sprite, tw, th, tb[0] - pad, -pad)
+        res = (sprite, tw, th, -pad, -pad)
         self._minimap_label_cache[key] = res
         return res
 
@@ -1017,52 +1016,19 @@ class MinimapFrameRenderer:
                 prio = 0 if is_self else (1 if meta.relation == RELATION_ENEMY else 3)
                 label_requests.append((prio, meta, st, px, py, True))
 
-        # 3. 预缓存无黑框细描边中文船名 + 防重叠（零 FreeType 逐帧开销）
-        label_requests.sort(key=lambda item: (item[0], item[4], item[3]))
-        placed_boxes: list[tuple[float, float, float, float]] = []
-
-        def _overlaps(box: tuple[float, float, float, float]) -> bool:
-            x0, y0, x1, y1 = box
-            for ox0, oy0, ox1, oy1 in placed_boxes:
-                if x0 < ox1 and x1 > ox0 and y0 < oy1 and y1 > oy0:
-                    return True
-            return False
-
+        # 3. 预缓存无黑框细描边中文船名：始终固定居中锚定在船只图标（及迷你血条）正下方，
+        #    不做上下翻转避让，杜绝多船靠近时船名突然漂移到船只图标上方或跨帧闪烁；
+        #    按优先级从低到高绘制（友军 -> 灭点 -> 在点敌军 -> 主角置顶）。
+        label_requests.sort(key=lambda item: (-item[0], item[4], item[3]))
         for _prio, meta, st, px, py, is_spotted in label_requests:
             sprite, tw, th, dx, dy = self._get_minimap_label_sprite(meta, is_spotted)
 
             has_bar = is_spotted and self.config.show_mini_hp_bars and st.max_hp > 0 and (st.in_aoi or meta.relation == RELATION_SELF)
             base_down = 19 if has_bar else 14
-            candidates = (
-                (px - tw * 0.5, py + base_down),
-                (px - tw * 0.5, py - 14 - th),
-                (px + 15, py - th * 0.5),
-                (px - 15 - tw, py - th * 0.5),
-                (px + 12, py + base_down),
-                (px - 12 - tw, py + base_down),
-                (px + 12, py - 14 - th),
-                (px - 12 - tw, py - 14 - th),
-                (px - tw * 0.5, py + base_down + th + 3),
-                (px - tw * 0.5, py - 17 - th * 2),
-            )
+            cx0 = max(2.0, min(MINIMAP_SIZE - tw - 2.0, px - tw * 0.5))
+            cy0 = max(2.0, min(MINIMAP_SIZE - th - 2.0, py + base_down))
 
-            chosen = None
-            for cx0, cy0 in candidates:
-                cx0 = max(4.0, min(MINIMAP_SIZE - tw - 4.0, cx0))
-                cy0 = max(4.0, min(MINIMAP_SIZE - th - 4.0, cy0))
-                box = (cx0 - 1, cy0 - 1, cx0 + tw + 1, cy0 + th + 1)
-                if not _overlaps(box):
-                    chosen = (cx0, cy0)
-                    placed_boxes.append(box)
-                    break
-
-            if chosen is None:
-                cx0 = max(4.0, min(MINIMAP_SIZE - tw - 4.0, candidates[0][0]))
-                cy0 = max(4.0, min(MINIMAP_SIZE - th - 4.0, candidates[0][1]))
-                chosen = (cx0, cy0)
-                placed_boxes.append((cx0, cy0, cx0 + tw, cy0 + th))
-
-            lx, ly = round(chosen[0]), round(chosen[1])
+            lx, ly = round(cx0), round(cy0)
             _blit_rgba(minimap, sprite, lx + dx, ly + dy)
 
     def _draw_planes(self, minimap: Image.Image, frame: BattleFrame) -> None:

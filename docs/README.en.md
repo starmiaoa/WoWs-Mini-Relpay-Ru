@@ -10,24 +10,26 @@ A minimap replay renderer built specifically for the Russian **Mir Korabley (Les
 
 ## How to Use
 
-1. Download `WoWs-Mini-Relpay-Ru-win64.zip` from [Releases](https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru/releases).
-2. **Extract** the archive to any folder, then double-click `WoWs-Mini-Relpay-Ru.exe`.
-3. On launch, it automatically detects your Live / Public Test (PT) Mir Korabley installation and lists all `.korablireplay` files in `replays/` (or click **Choose Folder** in the top-right to pick it manually).
-4. Check the matches you want to render, or drag and drop `.korablireplay` files directly into the window.
-5. Pick your resolution (`1920×1080` default) and frame rate (`30fps` default) on the right, then click **Render**.
-6. Once done, the app automatically opens the timestamped output folder containing your videos.
+1. Download one of the three Windows packages from [Releases](https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru/releases):
+   - **Windows Installer (Recommended)**: `WoWs-Mini-Relpay-Ru-Setup-win64.exe` — effortless setup with Start Menu and Desktop shortcuts.
+   - **Portable Packages (No Install)**: `WoWs-Mini-Relpay-Ru-win64.7z` or `WoWs-Mini-Relpay-Ru-win64.zip` — **extract** the archive first, then double-click `WoWs-Mini-Relpay-Ru.exe`.
+2. On launch, it automatically detects your Live / Public Test (PT) Mir Korabley installation and lists all `.korablireplay` files in `replays/` (or click **Browse** in the top-right to pick it manually).
+3. Check the matches you want to render, or drag and drop `.korablireplay` files directly into the window.
+4. Pick a standard 16:9 resolution (`720p` / `1K 1920×1080` default / `2K` / `4K`) and frame rate (**`25fps`** default; `25` / `30` / `60` fps, decoupled from playback speed so higher FPS improves smoothness without speeding up the battle), then click **Render**.
+5. Once done, the app automatically opens the timestamped output folder containing your videos.
 
 > On first launch, the app quietly extracts maps, official icons, and localization data from your local game folder in the background (takes a few seconds), so you won't have to wait next time.  
-> To toggle minimap layers, export keyframes, or switch theme/language, open the **Advanced** or **Settings** tab at the top.
+> Playback speed defaults to the upstream `20×` battle speed and can be adjusted in the **Settings** tab from `0.5×` (2× slower) to `4×` (4× faster). Open **Advanced** or **Settings** at the top to toggle minimap layers, export keyframes, or switch theme/language.
 
 ---
 
-## What if the Game or Localization Mod Updates?
+## Updating Game Assets, Mods, or the App
 
-In most cases you don't need to wait for a new tool release — just sync locally:
+In most cases you can handle updates directly inside the app:
 
 - **After a major game patch**: Open the app → **Settings** → **Resync Client Assets** (takes a few seconds).
-- **If only your localization mod updated**: Open **Settings** → **Refresh Localization Only** (takes ~1 second).
+- **If only your localization mod updated**: Open **Settings** → **Sync Localization Only** (takes ~1 second).
+- **When a new app release is available**: Open **About** → click **Check for Updates**, then use **Quick Update** to automatically download and apply the latest GitHub Release (preserving your local `data/` cache and `output/` videos).
 
 If a rare breaking protocol change causes parsing errors, see [UPDATING.md](../UPDATING.md) for troubleshooting, or open an Issue with a sample `.korablireplay` from the new version.
 
@@ -50,12 +52,12 @@ uv sync --extra dev
 
 # 3. Render a single replay via CLI
 .\.venv\Scripts\korabli-minimap.exe render "D:\Games\Korabli\replays\xxx.korablireplay" `
-  -o "output\battle.mp4" --resolution 1920x1080 --fps 30 --lang en
+  -o "output\battle.mp4" --resolution 1920x1080 --fps 25 --speed 1.0 --lang en
 
 # 4. Inspect replay diagnostics without rendering video
 .\.venv\Scripts\korabli-minimap.exe inspect "D:\Games\Korabli\replays\xxx.korablireplay"
 
-# 5. Build the portable Windows EXE and release ZIP
+# 5. Build the portable Windows EXE and release archives (ZIP / 7z)
 .\.venv\Scripts\python.exe scripts\build_release.py
 
 # 6. Run automated tests

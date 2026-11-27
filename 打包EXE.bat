@@ -12,5 +12,8 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo 可直接将 dist\WoWs-Mini-Relpay-Ru-win64.zip 上传到 GitHub Releases 供无 Python 环境用户解压即用！
+echo Nuitka 编译、签名及全套发布包构建完成：
+echo   - dist\WoWs-Mini-Relpay-Ru-Setup-win64.exe  (安装包)
+echo   - dist\WoWs-Mini-Relpay-Ru-win64.7z        (7z 便携包)
+echo   - dist\WoWs-Mini-Relpay-Ru-win64.zip       (ZIP 便携包)
 pause

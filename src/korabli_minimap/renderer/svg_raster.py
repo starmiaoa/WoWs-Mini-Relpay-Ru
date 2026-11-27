@@ -1,7 +1,7 @@
-"""纯 Python + Pillow/NumPy 精确 SVG 路径光栅化器（支持 evenodd 镂空与三次贝塞尔曲线）。
+"""纯 Python + Pillow 精确 SVG 路径光栅化器（支持 evenodd 镂空与三次贝塞尔曲线，零 NumPy 依赖）。
 
 专门用于将俄服客户端 gui.idx 提取的官方 SVG 舰种/小地图/飞机图标无损渲染为高清晰抗锯齿 RGBA 图像，
-无需依赖 Windows 上难安装的原生 Cairo/librsvg DLL。
+无需依赖 Windows 上难安装的原生 Cairo/librsvg DLL 或重型 OpenBLAS 运行时。
 """
 
 from __future__ import annotations
@@ -10,8 +10,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 
 _TOKEN_RE = re.compile(r"[MmLlHhVvCcSsQqZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
@@ -270,20 +269,19 @@ def rasterize_svg(
             continue
 
         fill_rule = elem.attrib.get("fill-rule", "nonzero").strip().lower()
-        acc = np.zeros((hi_h, hi_w), dtype=np.uint8)
+        acc = Image.new("1", (hi_w, hi_h), 0)
         for poly in subpaths:
             if len(poly) < 3:
                 continue
             scaled_pts = [(p[0] * scale + off_x, p[1] * scale + off_y) for p in poly]
-            tmp = Image.new("L", (hi_w, hi_h), 0)
+            tmp = Image.new("1", (hi_w, hi_h), 0)
             ImageDraw.Draw(tmp).polygon(scaled_pts, fill=1)
-            arr = np.asarray(tmp, dtype=np.uint8)
             if fill_rule == "evenodd":
-                acc ^= arr
+                acc = ImageChops.logical_xor(acc, tmp)
             else:
-                acc |= arr
+                acc = ImageChops.logical_or(acc, tmp)
 
-        mask = Image.fromarray((acc * 255).astype(np.uint8), mode="L")
+        mask = acc.convert("L")
         layer = Image.new("RGBA", (hi_w, hi_h), (0, 0, 0, 0))
         layer.paste(draw_col, (0, 0), mask)
         canvas = Image.alpha_composite(canvas, layer)

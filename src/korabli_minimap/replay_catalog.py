@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-from .extractor.localization import LocalizationBundle
 from .extractor.store import VersionDataStore
 from .i18n import (
     clean_english_ship_name,
@@ -18,6 +17,9 @@ from .i18n import (
     translate_species_short,
 )
 from .parser.container import read_replay_meta_only
+
+if TYPE_CHECKING:
+    from .extractor.localization import LocalizationBundle
 
 
 ROMAN_TIERS = {

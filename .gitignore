@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 dist/
 build/
+*.build/
+*.dist/
+*.onefile-build/
 *.egg-info/
 output/
 *.mp4
@@ -12,3 +15,6 @@ output/
 data/versions/
 data/gui_settings.json
 AGENT_MAINTENANCE.md
+
+# 本地代码签名证书与私钥目录（严禁提交到 GitHub！）
+certs/

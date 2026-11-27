@@ -117,6 +117,7 @@ def parse_replay(
     replay_path: Path | str,
     data_dir: Path | str = DEFAULT_DATA_DIR,
     store: VersionDataStore | None = None,
+    seconds_per_frame: float | None = None,
 ) -> tuple[BattleTimeline, VersionDataStore]:
     """解析单个俄服 .korablireplay 文件，返回标准化 BattleTimeline 与对应版本仓库。"""
     container: ReplayContainer = read_replay_container(replay_path)
@@ -129,6 +130,7 @@ def parse_replay(
         replay_path=str(container.path),
         meta=container.meta,
         store=store,
+        seconds_per_frame=seconds_per_frame,
     )
 
     # 仅按 account_db_id 准备 Block 1 补充映射，待 0x1d 权威名单到达时合并
@@ -148,6 +150,7 @@ def parse_replay(
         pt = pkt.packet_type
         pl = pkt.payload
         clk = pkt.clock
+        sm.on_clock_tick(clk)
 
         if pt == pmap.base_player_create and len(pl) >= 6:
             eid, tid = struct.unpack_from("<IH", pl, 0)

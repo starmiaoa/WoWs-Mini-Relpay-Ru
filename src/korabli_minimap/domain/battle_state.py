@@ -192,12 +192,15 @@ class BattleStateMachine:
         replay_path: str,
         meta: dict[str, Any],
         store: VersionDataStore,
-        seconds_per_frame: float = 1.0,
+        seconds_per_frame: float | None = None,
     ) -> None:
         self.replay_path = replay_path
         self.meta = meta
         self.store = store
-        self.seconds_per_frame = max(0.25, float(seconds_per_frame))
+        self._uniform_sampling: bool = seconds_per_frame is not None
+        self.seconds_per_frame: float = (
+            max(0.05, float(seconds_per_frame)) if seconds_per_frame is not None else 1.0
+        )
 
         self.client_version = str(
             meta.get("clientVersionFromExe") or meta.get("clientVersionFromXml") or store.version
@@ -225,6 +228,7 @@ class BattleStateMachine:
         self.shells: list[_MutableShell] = []
         self.planes: dict[int, _MutablePlane] = {}
         self._plane_tracks: dict[int, list[tuple[float, float, float]]] = {}
+        self._ship_tracks: dict[int, list[tuple[float, float, float, float]]] = {}
         self.fighter_wards: dict[int, _MutableFighterWard] = {}
         self.kills: list[KillEvent] = []
         self.chat_messages: list[ChatMessage] = []
@@ -246,6 +250,8 @@ class BattleStateMachine:
         self.frames: list[BattleFrame] = []
         self._last_snapshot_time_left: int | None = None
         self._last_snapshot_clock: float = -999.0
+        self._next_sample_clock: float | None = None
+        self._sampling_active: bool = False
         self._battle_started: bool = False
         self._battle_ended: bool = False
 
@@ -473,6 +479,19 @@ class BattleStateMachine:
         if ship is not None:
             ship.in_aoi = False
 
+    def _record_ship_track(self, vehicle_id: int, clock: float, x: float, z: float, yaw: float) -> None:
+        if not self._uniform_sampling or self.seconds_per_frame >= 0.99:
+            return
+        pts = self._ship_tracks.setdefault(vehicle_id, [])
+        if pts:
+            dt = clock - pts[-1][0]
+            if dt < 0.0:
+                return
+            if dt < 0.05:
+                pts[-1] = (clock, x, z, yaw)
+                return
+        pts.append((clock, x, z, yaw))
+
     def on_vehicle_position(self, vehicle_id: int, x: float, z: float, yaw: float, clock: float) -> None:
         ship = self.ships.get(vehicle_id)
         if ship is None or not ship.is_alive:
@@ -489,6 +508,8 @@ class BattleStateMachine:
             ship.is_spotted = True
             ship.has_been_spotted = True
             ship.last_spotted_clock = clock
+        if ship.is_spotted:
+            self._record_ship_track(vehicle_id, clock, x, z, yaw)
 
     def on_vehicle_property(self, vehicle_id: int, prop_name: str, value: Any, clock: float) -> None:
         ship = self.ships.get(vehicle_id)
@@ -553,6 +574,7 @@ class BattleStateMachine:
                 ship.x = wx
                 ship.z = wz
                 ship.yaw_rad = yaw_rad
+                self._record_ship_track(vid, clock, wx, wz, yaw_rad)
 
     # ---------------- 烟雾实体事件 ----------------
 
@@ -674,11 +696,37 @@ class BattleStateMachine:
                 if isinstance(hold, list) and hold:
                     self.hold_rules = hold
 
-        # 战斗开始后（battleStage == 0），每当 timeLeft 递减即采样 1 帧
+        # 战斗开始后（battleStage == 0）采样控制：
+        # - 均匀采样模式（传入 seconds_per_frame）：在首次 timeLeft 递减锚定起点，后续由 on_clock_tick 按步长均匀采样；
+        # - 经典模式（seconds_per_frame=None）：每当 timeLeft 递减即采样 1 帧（每秒 1 帧）。
         if time_left_changed and self.battle_stage == 0 and not self._battle_ended:
-            if self._last_snapshot_time_left is None or self.time_left < self._last_snapshot_time_left:
-                self._last_snapshot_time_left = self.time_left
-                self._emit_frame(clock)
+            if self._uniform_sampling:
+                if not self._sampling_active:
+                    self._sampling_active = True
+                    self._last_snapshot_time_left = self.time_left
+                    self._emit_frame(clock)
+                    self._next_sample_clock = clock + self.seconds_per_frame
+                elif self._last_snapshot_time_left is None or self.time_left < self._last_snapshot_time_left:
+                    self._last_snapshot_time_left = self.time_left
+            else:
+                if self._last_snapshot_time_left is None or self.time_left < self._last_snapshot_time_left:
+                    self._last_snapshot_time_left = self.time_left
+                    self._emit_frame(clock)
+
+    def on_clock_tick(self, clock: float) -> None:
+        """在均匀步长采样模式下按战局时钟推进采样帧（实现倍速与输出帧率解耦）。"""
+        if not self._uniform_sampling or not self._sampling_active or self._battle_ended:
+            return
+        if self._next_sample_clock is None or clock < self._next_sample_clock:
+            return
+        emitted = 0
+        # 防止异常回放时间戳跳变导致死循环（单次最多补齐 60 帧）
+        while self._next_sample_clock is not None and clock >= self._next_sample_clock and emitted < 60:
+            self._emit_frame(self._next_sample_clock)
+            self._next_sample_clock += self.seconds_per_frame
+            emitted += 1
+        if self._next_sample_clock is not None and clock >= self._next_sample_clock:
+            self._next_sample_clock = clock + self.seconds_per_frame
 
     def on_battle_end(self, clock: float) -> None:
         if not self._battle_ended:
@@ -1314,10 +1362,56 @@ class BattleStateMachine:
             smoothed.append(replace(frame, planes=tuple(new_planes)) if changed else frame)
         return smoothed
 
+    def _apply_smooth_ship_interpolation(self, frames: list[BattleFrame]) -> list[BattleFrame]:
+        """在亚秒采样模式下（如 25/30/60fps 或 0.5× 慢放）对在点舰船做平滑位置与航向插值，消除 1Hz 顿挫。"""
+        if not frames or not self._ship_tracks or not self._uniform_sampling or self.seconds_per_frame >= 0.99:
+            return frames
+
+        track_index: dict[int, tuple[list[float], list[tuple[float, float, float, float]]]] = {}
+        for vid, pts in self._ship_tracks.items():
+            if len(pts) >= 2:
+                track_index[vid] = ([pt[0] for pt in pts], pts)
+        if not track_index:
+            return frames
+
+        two_pi = 2.0 * math.pi
+        smoothed: list[BattleFrame] = []
+        for frame in frames:
+            t = frame.clock
+            new_ships: dict[int, ShipState] | None = None
+            for vid, s in frame.ships.items():
+                if not s.is_alive or not s.is_spotted:
+                    continue
+                entry = track_index.get(vid)
+                if entry is None:
+                    continue
+                ts, pts = entry
+                hi = bisect_right(ts, t)
+                if hi <= 0 or hi >= len(pts):
+                    continue
+                t1, x1, z1, y1 = pts[hi - 1]
+                t2, x2, z2, y2 = pts[hi]
+                dt = t2 - t1
+                if dt <= 0.05 or dt > 2.5:
+                    continue
+                if math.hypot(x2 - x1, z2 - z1) > 60.0:
+                    continue
+                u = max(0.0, min(1.0, (t - t1) / dt))
+                ix = x1 + (x2 - x1) * u
+                iz = z1 + (z2 - z1) * u
+                dy = (y2 - y1 + math.pi) % two_pi - math.pi
+                iy = y1 + dy * u
+                if new_ships is None:
+                    new_ships = dict(frame.ships)
+                new_ships[vid] = replace(s, x=ix, z=iz, yaw_rad=iy)
+            smoothed.append(replace(frame, ships=new_ships) if new_ships is not None else frame)
+        return smoothed
+
     def build_timeline(self, extra_diagnostics: dict[str, Any] | None = None) -> BattleTimeline:
         if not self.frames and self.ships:
             self._emit_frame(0.0)
         smoothed_frames = self._apply_smooth_plane_interpolation()
+        smoothed_frames = self._apply_smooth_ship_interpolation(smoothed_frames)
 
         # 推断胜负文案
         if self.win_team is not None:

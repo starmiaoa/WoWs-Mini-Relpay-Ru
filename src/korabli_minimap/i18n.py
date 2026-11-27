@@ -14,10 +14,9 @@ import re
 import sys
 from typing import Any
 
-try:
-    import zhconv as _zhconv
-except ImportError:
-    _zhconv = None
+# zhconv 词典体积较大，按需懒加载（仅使用繁体中文 zh_TW 时才载入内存）
+_zhconv: Any = None
+_zhconv_loaded: bool = False
 
 
 DEFAULT_LANG = "zh_CN"
@@ -110,8 +109,19 @@ def detect_system_language() -> str:
 
 
 def to_traditional_zh(text: str) -> str:
-    """将简体中文精准转换为繁体中文（zh-tw）。"""
-    if not text or _zhconv is None:
+    """将简体中文精准转换为繁体中文（zh-tw，首次调用时懒加载 zhconv）。"""
+    global _zhconv, _zhconv_loaded
+    if not text:
+        return text
+    if not _zhconv_loaded:
+        _zhconv_loaded = True
+        try:
+            import zhconv as _mod
+
+            _zhconv = _mod
+        except ImportError:
+            _zhconv = None
+    if _zhconv is None:
         return text
     return str(_zhconv.convert(text, "zh-tw"))
 
@@ -337,7 +347,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "res_720p": "1280 × 720   (720p)",
         "res_2k": "2560 × 1440  (2K)",
         "res_4k": "3840 × 2160  (4K)",
-        "res_custom": "自定义分辨率",
         "label_fps": "帧率 (FPS)",
         "sel_hint_empty": "请勾选左侧回放，或拖入文件",
         "sel_hint_count": "已选择 {n} 场回放",
@@ -387,6 +396,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "theme_system": "跟随系统",
         "theme_dark": "深色",
         "theme_light": "浅色",
+        "set_playback_title": "播放与倍速",
+        "label_speed": "播放倍率：",
+        "speed_pill_slow2": "0.5× (慢2倍)",
+        "speed_pill_default": "1× (默认)",
         "set_client_title": "客户端与汉化数据",
         "set_client_summary": "已识别客户端：正式服 {live} 个、PT 测试服 {pt} 个\n当前选中目录：{cur}\n已缓存数据版本：{vers}",
         "not_selected": "未选择",
@@ -407,6 +420,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "about_meta": "应用版本：{app_ver}  ·  已同步俄服版本：{vers}  ·  内置 FFmpeg",
         "btn_visit_github": "访问 GitHub 仓库",
         "btn_open_app_dir": "打开程序目录",
+        "btn_check_update": "检查更新",
+        "btn_pull_update": "快速拉取更新",
+        "btn_cancel_update": "取消下载",
+        "btn_open_release": "打开发布页",
+        "upd_checking": "正在检查 GitHub 最新版本...",
+        "upd_latest": "当前已是最新版本（v{ver}）",
+        "upd_available": "发现新版本 v{latest}（当前 v{cur}）",
+        "upd_downloading": "正在拉取更新：{done} / {total} ({pct}%)",
+        "upd_downloading_unknown": "正在拉取更新：{done}",
+        "upd_applying": "下载完成，正在应用更新并重启...",
+        "upd_cancelled": "已取消更新下载",
+        "upd_dev_hint": "当前为源码开发模式，请点击「打开发布页」查看或使用 git pull 更新。",
+        "upd_failed": "检查/拉取更新失败：{err}",
         "about_credit": "视觉与渲染管线参考 WoWs-Builder-Team/minimap_renderer · 汉化词库自动读取客户端本地化 mod",
         # ---- 弹窗 ----
         "msg_no_replays_title": "未发现回放文件",
@@ -486,7 +512,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "res_720p": "1280 × 720   (720p)",
         "res_2k": "2560 × 1440  (2K)",
         "res_4k": "3840 × 2160  (4K)",
-        "res_custom": "自訂解析度",
         "label_fps": "影格率 (FPS)",
         "sel_hint_empty": "請勾選左側重播，或拖入檔案",
         "sel_hint_count": "已選擇 {n} 場重播",
@@ -536,6 +561,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "theme_system": "跟隨系統",
         "theme_dark": "深色",
         "theme_light": "淺色",
+        "set_playback_title": "播放與倍速",
+        "label_speed": "播放倍率：",
+        "speed_pill_slow2": "0.5× (慢2倍)",
+        "speed_pill_default": "1× (預設)",
         "set_client_title": "客戶端與中文化資料",
         "set_client_summary": "已識別客戶端：正式服 {live} 個、PT 測試服 {pt} 個\n目前選中目錄：{cur}\n已快取資料版本：{vers}",
         "not_selected": "未選擇",
@@ -556,6 +585,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "about_meta": "應用版本：{app_ver}  ·  已同步俄服版本：{vers}  ·  內建 FFmpeg",
         "btn_visit_github": "前往 GitHub 儲存庫",
         "btn_open_app_dir": "開啟程式目錄",
+        "btn_check_update": "檢查更新",
+        "btn_pull_update": "快速拉取更新",
+        "btn_cancel_update": "取消下載",
+        "btn_open_release": "開啟發布頁",
+        "upd_checking": "正在檢查 GitHub 最新版本...",
+        "upd_latest": "目前已是最新版本（v{ver}）",
+        "upd_available": "發現新版本 v{latest}（目前 v{cur}）",
+        "upd_downloading": "正在拉取更新：{done} / {total} ({pct}%)",
+        "upd_downloading_unknown": "正在拉取更新：{done}",
+        "upd_applying": "下載完成，正在套用更新並重新啟動...",
+        "upd_cancelled": "已取消更新下載",
+        "upd_dev_hint": "目前為原始碼開發模式，請點擊「開啟發布頁」檢視或使用 git pull 更新。",
+        "upd_failed": "檢查/拉取更新失敗：{err}",
         "about_credit": "視覺與渲染管線參考 WoWs-Builder-Team/minimap_renderer · 詞庫自動讀取客戶端本地化 mod",
         # ---- 弹窗 ----
         "msg_no_replays_title": "未發現重播檔案",
@@ -635,7 +677,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "res_720p": "1280 × 720   (720p)",
         "res_2k": "2560 × 1440  (2K)",
         "res_4k": "3840 × 2160  (4K)",
-        "res_custom": "Своё разрешение",
         "label_fps": "Частота (FPS)",
         "sel_hint_empty": "Отметьте реплеи или перетащите файлы",
         "sel_hint_count": "Выбрано реплеев: {n}",
@@ -685,6 +726,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "theme_system": "Как в системе",
         "theme_dark": "Тёмная",
         "theme_light": "Светлая",
+        "set_playback_title": "Воспроизведение и скорость",
+        "label_speed": "Множитель скорости:",
+        "speed_pill_slow2": "0.5× (-2×)",
+        "speed_pill_default": "1× (станд.)",
         "set_client_title": "Клиент и данные локализации",
         "set_client_summary": "Найдено клиентов: основа {live}, PT {pt}\nТекущая папка: {cur}\nСинхронизированные версии: {vers}",
         "not_selected": "Не выбрано",
@@ -705,6 +750,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "about_meta": "Версия: {app_ver}  ·  Клиент: {vers}  ·  Встроенный FFmpeg",
         "btn_visit_github": "Репозиторий GitHub",
         "btn_open_app_dir": "Папка программы",
+        "btn_check_update": "Проверить обновления",
+        "btn_pull_update": "Быстро обновить",
+        "btn_cancel_update": "Отмена",
+        "btn_open_release": "Страница релиза",
+        "upd_checking": "Проверка обновлений на GitHub...",
+        "upd_latest": "Установлена последняя версия (v{ver})",
+        "upd_available": "Доступна новая версия v{latest} (текущая v{cur})",
+        "upd_downloading": "Загрузка обновления: {done} / {total} ({pct}%)",
+        "upd_downloading_unknown": "Загрузка обновления: {done}",
+        "upd_applying": "Загрузка завершена, установка и перезапуск...",
+        "upd_cancelled": "Загрузка обновления отменена",
+        "upd_dev_hint": "Режим исходного кода — откройте страницу релиза или выполните git pull.",
+        "upd_failed": "Ошибка обновления: {err}",
         "about_credit": "Вдохновлено WoWs-Builder-Team/minimap_renderer · Адаптировано для Мир кораблей",
         # ---- Dialogs ----
         "msg_no_replays_title": "Реплеи не найдены",
@@ -784,7 +842,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "res_720p": "1280 × 720   (720p)",
         "res_2k": "2560 × 1440  (2K)",
         "res_4k": "3840 × 2160  (4K)",
-        "res_custom": "Custom",
         "label_fps": "Frame Rate (FPS)",
         "sel_hint_empty": "Select replays or drop files here",
         "sel_hint_count": "{n} replay(s) selected",
@@ -834,6 +891,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "theme_system": "Follow System",
         "theme_dark": "Dark",
         "theme_light": "Light",
+        "set_playback_title": "Playback Speed",
+        "label_speed": "Speed Multiplier:",
+        "speed_pill_slow2": "0.5× (-2×)",
+        "speed_pill_default": "1× (Default)",
         "set_client_title": "Client & Localization Data",
         "set_client_summary": "Detected clients: {live} Live, {pt} Public Test\nSelected folder: {cur}\nCached versions: {vers}",
         "not_selected": "None",
@@ -854,6 +915,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "about_meta": "Version: {app_ver}  ·  Synced Client: {vers}  ·  Bundled FFmpeg",
         "btn_visit_github": "Open GitHub Repository",
         "btn_open_app_dir": "Open App Folder",
+        "btn_check_update": "Check for Updates",
+        "btn_pull_update": "Quick Update",
+        "btn_cancel_update": "Cancel",
+        "btn_open_release": "Release Page",
+        "upd_checking": "Checking GitHub for updates...",
+        "upd_latest": "You are up to date (v{ver})",
+        "upd_available": "New version available: v{latest} (current v{cur})",
+        "upd_downloading": "Downloading update: {done} / {total} ({pct}%)",
+        "upd_downloading_unknown": "Downloading update: {done}",
+        "upd_applying": "Download complete — applying update & restarting...",
+        "upd_cancelled": "Update download cancelled",
+        "upd_dev_hint": "Running from source — open the Release page or run git pull.",
+        "upd_failed": "Update failed: {err}",
         "about_credit": "Inspired by WoWs-Builder-Team/minimap_renderer · Built specifically for Mir Korabley",
         # ---- Dialogs ----
         "msg_no_replays_title": "No Replays Found",

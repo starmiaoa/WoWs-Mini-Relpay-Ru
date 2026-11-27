@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import ctypes
+import gc
 import json
 import os
 from pathlib import Path
@@ -25,10 +27,12 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QGuiApplication,
+    QIcon,
     QPainter,
     QPainterPath,
     QPalette,
     QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -52,6 +56,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QStyle,
     QStyledItemDelegate,
@@ -61,19 +66,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .config import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, RenderConfig, get_app_root
-from .extractor import (
+from . import __version__ as APP_VERSION
+from .config import (
+    ALLOWED_RESOLUTIONS,
+    DEFAULT_DATA_DIR,
+    DEFAULT_FPS,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_SPEED_MULTIPLIER,
+    MAX_SPEED_MULTIPLIER,
+    MIN_SPEED_MULTIPLIER,
+    RenderConfig,
+    clamp_speed_multiplier,
+    get_app_root,
+    snap_to_allowed_resolution,
+)
+from .extractor.client_locator import (
     DiscoveredClient,
-    LocalizationBundle,
-    VersionDataStore,
     discover_korabli_clients,
-    list_synced_versions,
-    load_localization,
-    load_version_store,
     locate_client,
     normalize_short_version,
-    sync_client_data,
 )
+from .extractor.store import VersionDataStore, list_synced_versions, load_version_store
 from .i18n import (
     SUPPORTED_LANGUAGES,
     detect_system_language,
@@ -81,9 +94,7 @@ from .i18n import (
     tr,
     translate_client_channel,
 )
-from .parser import parse_replay
 from .parser.container import read_replay_meta_only
-from .renderer.video import RenderCancelledError, render_timeline_to_video
 from .replay_catalog import (
     ReplayListItem,
     collect_korabli_replays_from_paths,
@@ -93,17 +104,138 @@ from .replay_catalog import (
 )
 
 
-APP_VERSION = "0.2.0"
 PROJECT_ROOT = get_app_root()
 REPO_URL = "https://github.com/starmiaoa/WoWs-Mini-Relpay-Ru"
 
-RESOLUTION_PRESET_SPECS: list[tuple[str, int, int]] = [
-    ("res_1k", 1920, 1080),
-    ("res_720p", 1280, 720),
-    ("res_2k", 2560, 1440),
-    ("res_4k", 3840, 2160),
-    ("res_custom", 0, 0),
-]
+
+def _trim_process_memory() -> None:
+    """触发 Python GC 并温和通知 Windows 回收闲置工作集页面，降低常驻内存占用。"""
+    gc.collect()
+    if sys.platform == "win32":
+        try:
+            k32 = ctypes.WinDLL("kernel32")
+            psapi = ctypes.WinDLL("psapi")
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+            psapi.EmptyWorkingSet(k32.GetCurrentProcess())
+        except Exception:
+            pass
+
+
+def _set_win32_app_user_model_id() -> None:
+    """在创建 QApplication 前注册独立 AppUserModelID，确保 Windows 任务栏显示专属应用图标而非默认占位图标。"""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("starmiaoa.WoWsMiniRelpayRu.Desktop.1")
+        except Exception:
+            pass
+
+
+def _resolve_app_icon_path() -> Path | None:
+    """定位应用图标文件（兼容 Nuitka/PyInstaller 打包目录与源码开发目录）。"""
+    for cand in (
+        PROJECT_ROOT / "app_icon.ico",
+        PROJECT_ROOT / "packaging" / "app_icon.ico",
+        Path(__file__).resolve().parents[2] / "packaging" / "app_icon.ico",
+    ):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _paint_badge_pixmap(size: int) -> QPixmap:
+    """用 QPainter 矢量绘制祖母绿战术战舰徽标（作为任务栏/窗口图标的多档 DPI 兜底来源）。"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pad = max(1.0, size * 0.04)
+    radius = size * 0.19
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(20, 156, 120))
+    p.drawRoundedRect(int(round(pad)), int(round(pad)), int(round(size - 2 * pad)), int(round(size - 2 * pad)), radius, radius)
+
+    inner = size * 0.165
+    inner_r = size * 0.105
+    p.setPen(QPen(QColor(255, 255, 255, 200), max(1.2, size * 0.032)))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(int(round(inner)), int(round(inner)), int(round(size - 2 * inner)), int(round(size - 2 * inner)), inner_r, inner_r)
+
+    path = QPainterPath()
+    path.moveTo(size * 0.50, size * 0.275)
+    path.lineTo(size * 0.655, size * 0.655)
+    path.lineTo(size * 0.50, size * 0.565)
+    path.lineTo(size * 0.345, size * 0.655)
+    path.closeSubpath()
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(255, 255, 255))
+    p.drawPath(path)
+    p.end()
+    return pm
+
+
+def _build_app_icon(icon_path: Path | None) -> QIcon:
+    """构建多分辨率窗口与任务栏图标（优先加载 app_icon.ico，缺失或插件异常时自动矢量绘制兜底）。"""
+    if icon_path is not None and icon_path.is_file():
+        ico = QIcon(str(icon_path))
+        if not ico.isNull() and ico.availableSizes():
+            return ico
+    fallback = QIcon()
+    for sz in (16, 24, 32, 40, 48, 64, 128, 256):
+        fallback.addPixmap(_paint_badge_pixmap(sz))
+    return fallback
+
+
+def _apply_win32_taskbar_icon(win: QMainWindow, icon_path: Path | None) -> list[int]:
+    """在 Windows 上显式向窗口发送 WM_SETICON (ICON_SMALL / ICON_BIG)，确保任务栏与 Alt-Tab 显示高清图标。"""
+    if sys.platform != "win32" or icon_path is None or not icon_path.is_file():
+        return []
+    handles: list[int] = []
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.LoadImageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+
+        hwnd = int(win.winId())
+        if not hwnd:
+            return []
+
+        image_icon = 1
+        lr_loadfromfile = 0x0010
+        wm_seticon = 0x0080
+
+        sm_w = max(16, int(user32.GetSystemMetrics(49) or 16))  # SM_CXSMICON
+        sm_h = max(16, int(user32.GetSystemMetrics(50) or 16))  # SM_CYSMICON
+        big_w = max(48, int(user32.GetSystemMetrics(11) or 32))  # SM_CXICON
+        big_h = max(48, int(user32.GetSystemMetrics(12) or 32))  # SM_CYICON
+
+        h_small = user32.LoadImageW(None, str(icon_path), image_icon, sm_w, sm_h, lr_loadfromfile)
+        if h_small:
+            user32.SendMessageW(hwnd, wm_seticon, 0, h_small)
+            handles.append(int(h_small))
+
+        h_big = user32.LoadImageW(None, str(icon_path), image_icon, big_w, big_h, lr_loadfromfile)
+        if h_big:
+            user32.SendMessageW(hwnd, wm_seticon, 1, h_big)
+            handles.append(int(h_big))
+    except Exception:
+        pass
+    return handles
+
+
+RESOLUTION_PRESET_SPECS: list[tuple[str, int, int]] = list(ALLOWED_RESOLUTIONS)
+SPEED_PRESET_VALUES: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 4.0)
 
 ROLE_PATH_KEY = Qt.ItemDataRole.UserRole + 1
 ROLE_REPLAY_ITEM = Qt.ItemDataRole.UserRole + 2
@@ -311,24 +443,49 @@ QPushButton:disabled {{
     color: {muted};
 }}
 
-QPushButton.FpsPill {{
+QPushButton.FpsPill, QPushButton.SpeedPill {{
     background-color: {inp};
     color: {text_sec};
     border: 1px solid {border};
     border-radius: 6px;
-    padding: 5px 0px;
+    padding: 5px 8px;
     font-weight: bold;
 }}
 
-QPushButton.FpsPill:hover {{
+QPushButton.FpsPill:hover, QPushButton.SpeedPill:hover {{
     border-color: {border_hi};
     color: {text};
 }}
 
-QPushButton.FpsPill[active="true"] {{
+QPushButton.FpsPill[active="true"], QPushButton.SpeedPill[active="true"] {{
     background-color: {accent_soft};
     color: {accent_txt};
     border: 1px solid {accent};
+}}
+
+QSlider::groove:horizontal {{
+    border: none;
+    height: 6px;
+    background-color: {inp};
+    border-radius: 3px;
+}}
+
+QSlider::sub-page:horizontal {{
+    background-color: {accent};
+    border-radius: 3px;
+}}
+
+QSlider::handle:horizontal {{
+    background-color: {accent};
+    border: 2px solid {panel};
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 9px;
+}}
+
+QSlider::handle:horizontal:hover {{
+    background-color: {accent_hv};
 }}
 
 QPushButton#PrimaryBtn {{
@@ -687,6 +844,8 @@ class AutoSyncWorker(QThread):
         self.i18n_only = i18n_only
 
     def run(self) -> None:
+        from .extractor.sync import sync_client_data
+
         try:
             mode = "i18n-only" if self.i18n_only else "full"
             self.log_signal.emit(f"[Sync] {self.game_dir} ({mode})...")
@@ -703,6 +862,8 @@ class AutoSyncWorker(QThread):
         except Exception as exc:
             self.log_signal.emit(f"[Error] Sync failed: {exc}")
             self.finished_signal.emit(False, "", str(exc))
+        finally:
+            gc.collect()
 
 
 class BatchRenderWorker(QThread):
@@ -736,6 +897,8 @@ class BatchRenderWorker(QThread):
         self._cancelled = True
 
     def _ensure_synced(self, replay_path: Path) -> None:
+        from .extractor.sync import sync_client_data
+
         synced = set(list_synced_versions(self.data_dir))
         if not self.selected_game_dir or not self.selected_game_dir.is_dir():
             return
@@ -770,6 +933,9 @@ class BatchRenderWorker(QThread):
             pass
 
     def run(self) -> None:
+        from .parser import parse_replay
+        from .renderer.video import RenderCancelledError, render_timeline_to_video
+
         batch_dir = create_batch_output_dir(self.output_root)
         total_items = len(self.items)
         ok_count = 0
@@ -778,7 +944,9 @@ class BatchRenderWorker(QThread):
         out_w, out_h = self.render_config.resolved_output_size()
 
         self.log_signal.emit(
-            f"=== Batch ({total_items} | {out_w}x{out_h} @ {self.render_config.fps}fps | lang={self.lang}) -> {batch_dir} ==="
+            f"=== Batch ({total_items} | {out_w}x{out_h} @ {self.render_config.fps}fps | "
+            f"{self.render_config.resolved_speed_multiplier():.2g}x / {self.render_config.effective_battle_speed():.0f}x | "
+            f"lang={self.lang}) -> {batch_dir} ==="
         )
 
         for idx, item in enumerate(self.items, start=1):
@@ -794,7 +962,11 @@ class BatchRenderWorker(QThread):
             try:
                 self._ensure_synced(item.path)
                 t0 = time.perf_counter()
-                timeline, store = parse_replay(item.path, data_dir=self.data_dir)
+                timeline, store = parse_replay(
+                    item.path,
+                    data_dir=self.data_dir,
+                    seconds_per_frame=self.render_config.resolved_seconds_per_frame(),
+                )
 
                 out_mp4 = batch_dir / f"{item.path.stem}.mp4"
                 dup = 2
@@ -826,6 +998,8 @@ class BatchRenderWorker(QThread):
                 ok_count += 1
                 mb = res.video_path.stat().st_size / (1024 * 1024)
                 self.log_signal.emit(f"  OK ({dt:.1f}s, {mb:.2f} MB, {res.encoder_used}) -> {res.video_path.name}")
+                del res, timeline, store
+                gc.collect()
             except RenderCancelledError:
                 self.log_signal.emit(f"  STOPPED: {item.filename}")
                 break
@@ -834,6 +1008,8 @@ class BatchRenderWorker(QThread):
                 err = f"{item.ship_display} ({item.filename}): {exc}"
                 errors.append(err)
                 self.log_signal.emit(f"  FAILED: {err}")
+            finally:
+                gc.collect()
 
         try:
             if ok_count == 0 and batch_dir.is_dir() and not any(batch_dir.iterdir()):
@@ -842,6 +1018,57 @@ class BatchRenderWorker(QThread):
             pass
 
         self.finished_signal.emit(str(batch_dir), ok_count, fail_count, self._cancelled, errors)
+
+
+class UpdateCheckWorker(QThread):
+    """后台检查 GitHub 最新 Release（按需懒加载 updater 模块，不增加待机内存）。"""
+
+    finished_signal = Signal(bool, object, str)
+
+    def __init__(self, current_version: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.current_version = current_version
+
+    def run(self) -> None:
+        from .updater import check_for_updates
+
+        try:
+            info = check_for_updates(current_version=self.current_version)
+            self.finished_signal.emit(True, info, "")
+        except Exception as exc:
+            self.finished_signal.emit(False, None, str(exc))
+
+
+class UpdateDownloadWorker(QThread):
+    """后台流式下载最新 Release 更新包（支持实时进度与安全取消）。"""
+
+    progress_signal = Signal(object, object)
+    finished_signal = Signal(bool, str, str, bool)  # ok, pkg_path, err_msg, cancelled
+
+    def __init__(self, asset: Any, update_mode: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.asset = asset
+        self.update_mode = update_mode
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from .updater import UpdateCancelledError, download_release_asset, validate_downloaded_package
+
+        try:
+            pkg_path = download_release_asset(
+                self.asset,
+                progress_callback=lambda done, total: self.progress_signal.emit(done, total),
+                cancel_check=lambda: self._cancelled,
+            )
+            validate_downloaded_package(pkg_path, self.update_mode)
+            self.finished_signal.emit(True, str(pkg_path), "", False)
+        except UpdateCancelledError:
+            self.finished_signal.emit(False, "", "", True)
+        except Exception as exc:
+            self.finished_signal.emit(False, "", str(exc), False)
 
 
 class MainWindow(QMainWindow):
@@ -868,12 +1095,18 @@ class MainWindow(QMainWindow):
         self.last_batch_dir: Path | None = None
 
         self._store_cache: VersionDataStore | None = None
-        self._live_loc_cache: dict[str, LocalizationBundle] = {}
         self._sync_worker: AutoSyncWorker | None = None
         self._render_worker: BatchRenderWorker | None = None
-        self._updating_res = False
+        self._update_check_worker: UpdateCheckWorker | None = None
+        self._update_dl_worker: UpdateDownloadWorker | None = None
+        self._latest_update_info: Any = None
+        self._updating_speed = False
         self._fps_buttons: dict[int, QPushButton] = {}
+        self._speed_buttons: dict[float, QPushButton] = {}
         self._sync_status_state: tuple[str, str] = ("idle", "")
+        self._icon_path: Path | None = _resolve_app_icon_path()
+        self._win32_hicons: list[int] = []
+        self._taskbar_icon_applied = False
 
         # 语言与主题模式（默认：跟随系统主题 + 跟随系统语言，非目标语言回退英语）
         saved_lang_mode = str(lang_override or self.settings.get("language_mode") or "system")
@@ -929,6 +1162,7 @@ class MainWindow(QMainWindow):
         try:
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
             cur = self._current_game_dir()
+            out_w, out_h = self._current_output_size()
             payload = {
                 "language_mode": self.language_mode,
                 "theme_mode": self.theme_mode,
@@ -936,9 +1170,10 @@ class MainWindow(QMainWindow):
                 "custom_game_dirs": self.custom_game_dirs[-8:],
                 "output_root": self.output_dir_edit.text().strip() or str(DEFAULT_OUTPUT_DIR),
                 "auto_open_folder": self.chk_auto_open.isChecked(),
-                "width": self.width_spin.value(),
-                "height": self.height_spin.value(),
+                "width": out_w,
+                "height": out_h,
                 "fps": self.fps_spin.value(),
+                "speed_multiplier": clamp_speed_multiplier(self.speed_spin.value()),
                 "show_smoke": self.chk_smoke.isChecked(),
                 "show_unspotted_names": self.chk_unspotted.isChecked(),
                 "show_spotted_names": self.chk_spotted.isChecked(),
@@ -957,6 +1192,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def showEvent(self, event: QEvent) -> None:
+        super().showEvent(event)
+        if not self._taskbar_icon_applied:
+            self._taskbar_icon_applied = True
+            self._win32_hicons = _apply_win32_taskbar_icon(self, self._icon_path)
+
     def closeEvent(self, event: QEvent) -> None:
         self._save_settings()
         if self._render_worker is not None and self._render_worker.isRunning():
@@ -964,6 +1205,20 @@ class MainWindow(QMainWindow):
             self._render_worker.wait(5000)
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self._sync_worker.wait(10000)
+        if self._update_dl_worker is not None and self._update_dl_worker.isRunning():
+            self._update_dl_worker.request_cancel()
+            self._update_dl_worker.wait(3000)
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            self._update_check_worker.wait(2000)
+        if self._win32_hicons and sys.platform == "win32":
+            try:
+                user32 = ctypes.WinDLL("user32")
+                user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+                for h in self._win32_hicons:
+                    user32.DestroyIcon(h)
+            except Exception:
+                pass
+            self._win32_hicons.clear()
         super().closeEvent(event)
 
     def _resolve_is_dark(self, mode: str) -> bool:
@@ -1179,28 +1434,11 @@ class MainWindow(QMainWindow):
         res_block.addWidget(self.lbl_res)
 
         self.res_combo = QComboBox()
-        for _key, _w, _h in RESOLUTION_PRESET_SPECS:
-            self.res_combo.addItem("")
-        self.res_combo.currentIndexChanged.connect(self._on_res_preset_changed)
+        for _key, w, h in RESOLUTION_PRESET_SPECS:
+            self.res_combo.addItem("", userData=(w, h))
+        # 默认选中 1K (1920x1080)
+        self.res_combo.setCurrentIndex(1)
         res_block.addWidget(self.res_combo)
-
-        self.custom_res_row = QWidget()
-        cr_lay = QHBoxLayout(self.custom_res_row)
-        cr_lay.setContentsMargins(0, 4, 0, 0)
-        cr_lay.setSpacing(6)
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(640, 7680)
-        self.width_spin.setSingleStep(16)
-        self.width_spin.setValue(1920)
-        self.height_spin = QSpinBox()
-        self.height_spin.setRange(360, 4320)
-        self.height_spin.setSingleStep(8)
-        self.height_spin.setValue(1080)
-        cr_lay.addWidget(self.width_spin, 1)
-        cr_lay.addWidget(QLabel("×"))
-        cr_lay.addWidget(self.height_spin, 1)
-        self.custom_res_row.setVisible(False)
-        res_block.addWidget(self.custom_res_row)
         s_lay.addLayout(res_block)
 
         fps_block = QVBoxLayout()
@@ -1211,18 +1449,18 @@ class MainWindow(QMainWindow):
 
         fps_row = QHBoxLayout()
         fps_row.setSpacing(6)
-        for val in (20, 30, 60):
+        for val in (25, 30, 60):
             btn = QPushButton(f"{val}")
             btn.setProperty("class", "FpsPill")
-            btn.setProperty("active", val == 30)
+            btn.setProperty("active", val == DEFAULT_FPS)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _=False, v=val: self._set_fps(v))
             fps_row.addWidget(btn, 1)
             self._fps_buttons[val] = btn
 
         self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(5, 120)
-        self.fps_spin.setValue(30)
+        self.fps_spin.setRange(10, 60)
+        self.fps_spin.setValue(DEFAULT_FPS)
         self.fps_spin.setFixedWidth(70)
         self.fps_spin.valueChanged.connect(self._sync_fps_pills)
         fps_row.addWidget(self.fps_spin)
@@ -1449,7 +1687,54 @@ class MainWindow(QMainWindow):
         a_lay.addLayout(theme_row)
         lay.addWidget(card_app)
 
-        # 2. 客户端与汉化数据
+        # 2. 播放与倍速（对齐原项目默认 20×，范围严格限制在 0.5× 慢2倍 ~ 4.0× 快4倍）
+        card_play = QFrame()
+        card_play.setProperty("class", "GroupCard")
+        p_lay = QVBoxLayout(card_play)
+        p_lay.setContentsMargins(16, 14, 16, 14)
+        p_lay.setSpacing(10)
+        self.lbl_set_playback = QLabel()
+        self.lbl_set_playback.setProperty("class", "CardTitle")
+        p_lay.addWidget(self.lbl_set_playback)
+
+        sp_row = QHBoxLayout()
+        sp_row.setSpacing(12)
+        self.lbl_speed = QLabel()
+        sp_row.addWidget(self.lbl_speed)
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(int(round(MIN_SPEED_MULTIPLIER * 100)), int(round(MAX_SPEED_MULTIPLIER * 100)))
+        self.speed_slider.setSingleStep(5)
+        self.speed_slider.setPageStep(25)
+        self.speed_slider.setValue(int(round(DEFAULT_SPEED_MULTIPLIER * 100)))
+        self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
+        sp_row.addWidget(self.speed_slider, 1)
+
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(MIN_SPEED_MULTIPLIER, MAX_SPEED_MULTIPLIER)
+        self.speed_spin.setSingleStep(0.25)
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setSuffix("×")
+        self.speed_spin.setValue(DEFAULT_SPEED_MULTIPLIER)
+        self.speed_spin.setFixedWidth(86)
+        self.speed_spin.valueChanged.connect(self._on_speed_spin_changed)
+        sp_row.addWidget(self.speed_spin)
+        p_lay.addLayout(sp_row)
+
+        sp_pills = QHBoxLayout()
+        sp_pills.setSpacing(8)
+        for mult in SPEED_PRESET_VALUES:
+            btn = QPushButton()
+            btn.setProperty("class", "SpeedPill")
+            btn.setProperty("active", abs(mult - DEFAULT_SPEED_MULTIPLIER) < 1e-6)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, m=mult: self._set_speed_multiplier(m, save=True))
+            sp_pills.addWidget(btn)
+            self._speed_buttons[mult] = btn
+        sp_pills.addStretch(1)
+        p_lay.addLayout(sp_pills)
+        lay.addWidget(card_play)
+
+        # 3. 客户端与汉化数据
         card_cli = QFrame()
         card_cli.setProperty("class", "GroupCard")
         c_lay = QVBoxLayout(card_cli)
@@ -1556,6 +1841,9 @@ class MainWindow(QMainWindow):
         lay.addSpacing(10)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
+        self.btn_check_update = QPushButton()
+        self.btn_check_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_update.clicked.connect(self._on_check_updates)
         self.btn_visit_gh = QPushButton()
         self.btn_visit_gh.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_visit_gh.clicked.connect(lambda: webbrowser.open(REPO_URL))
@@ -1563,6 +1851,7 @@ class MainWindow(QMainWindow):
         self.btn_open_app.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_app.clicked.connect(lambda: _open_folder_in_explorer(PROJECT_ROOT))
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_check_update)
         btn_row.addWidget(self.btn_visit_gh)
         btn_row.addWidget(self.btn_open_app)
         btn_row.addStretch(1)
@@ -1572,6 +1861,66 @@ class MainWindow(QMainWindow):
         url_lbl.setOpenExternalLinks(True)
         url_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(url_lbl)
+
+        # 在线检查更新与快速拉取更新卡片（点击「检查更新」后展开，待机零额外占用）
+        self.update_card = QFrame()
+        self.update_card.setProperty("class", "GroupCard")
+        self.update_card.setFixedWidth(560)
+        u_lay = QVBoxLayout(self.update_card)
+        u_lay.setContentsMargins(16, 12, 16, 12)
+        u_lay.setSpacing(8)
+
+        self.lbl_update_status = QLabel("")
+        self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold;")
+        self.lbl_update_status.setWordWrap(True)
+        u_lay.addWidget(self.lbl_update_status)
+
+        self.update_notes_box = QPlainTextEdit()
+        self.update_notes_box.setReadOnly(True)
+        self.update_notes_box.setMaximumHeight(110)
+        self.update_notes_box.setVisible(False)
+        u_lay.addWidget(self.update_notes_box)
+
+        self.update_progress = QProgressBar()
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setValue(0)
+        self.update_progress.setTextVisible(False)
+        self.update_progress.setVisible(False)
+        u_lay.addWidget(self.update_progress)
+
+        self.lbl_update_prog = QLabel("")
+        self.lbl_update_prog.setProperty("class", "Muted")
+        self.lbl_update_prog.setWordWrap(True)
+        self.lbl_update_prog.setVisible(False)
+        u_lay.addWidget(self.lbl_update_prog)
+
+        u_btns = QHBoxLayout()
+        u_btns.setSpacing(10)
+        self.btn_pull_update = QPushButton()
+        self.btn_pull_update.setProperty("class", "SpeedPill")
+        self.btn_pull_update.setProperty("active", True)
+        self.btn_pull_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pull_update.setVisible(False)
+        self.btn_pull_update.clicked.connect(self._on_pull_update)
+
+        self.btn_cancel_update = QPushButton()
+        self.btn_cancel_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel_update.setVisible(False)
+        self.btn_cancel_update.clicked.connect(self._on_cancel_update)
+
+        self.btn_open_release = QPushButton()
+        self.btn_open_release.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_release.setVisible(False)
+        self.btn_open_release.clicked.connect(self._on_open_release_page)
+
+        u_btns.addWidget(self.btn_pull_update)
+        u_btns.addWidget(self.btn_cancel_update)
+        u_btns.addWidget(self.btn_open_release)
+        u_btns.addStretch(1)
+        u_lay.addLayout(u_btns)
+
+        self.update_card.setVisible(False)
+        lay.addWidget(self.update_card, 0, Qt.AlignmentFlag.AlignHCenter)
 
         lay.addStretch(1)
 
@@ -1658,6 +2007,15 @@ class MainWindow(QMainWindow):
         self.rb_system.setText(self._t("theme_system"))
         self.rb_dark.setText(self._t("theme_dark"))
         self.rb_light.setText(self._t("theme_light"))
+        self.lbl_set_playback.setText(self._t("set_playback_title"))
+        self.lbl_speed.setText(self._t("label_speed"))
+        for mult, btn in self._speed_buttons.items():
+            if abs(mult - 0.5) < 1e-6:
+                btn.setText(self._t("speed_pill_slow2"))
+            elif abs(mult - 1.0) < 1e-6:
+                btn.setText(self._t("speed_pill_default"))
+            else:
+                btn.setText(f"{mult:g}×")
         self.lbl_set_client.setText(self._t("set_client_title"))
         self.btn_rescan_clients.setText(self._t("btn_rescan_clients"))
         self.btn_sync_i18n.setText(self._t("btn_sync_i18n"))
@@ -1673,6 +2031,10 @@ class MainWindow(QMainWindow):
 
         # Tab 4
         self.lbl_about_desc.setText(self._t("about_desc"))
+        self.btn_check_update.setText(self._t("btn_check_update"))
+        self.btn_pull_update.setText(self._t("btn_pull_update"))
+        self.btn_cancel_update.setText(self._t("btn_cancel_update"))
+        self.btn_open_release.setText(self._t("btn_open_release"))
         self.btn_visit_gh.setText(self._t("btn_visit_github"))
         self.btn_open_app.setText(self._t("btn_open_app_dir"))
         self.lbl_about_credit.setText(self._t("about_credit"))
@@ -1696,7 +2058,15 @@ class MainWindow(QMainWindow):
         w = int(self.settings.get("width") or 1920)
         h = int(self.settings.get("height") or 1080)
         self._set_resolution_controls(w, h)
-        self._set_fps(int(self.settings.get("fps") or 30))
+        # 兼容旧版配置平滑迁移：旧版默认写入 fps=30 且不含 speed_multiplier 时，自动迁至新版默认 25fps
+        raw_fps = self.settings.get("fps")
+        if "speed_multiplier" not in self.settings and raw_fps == 30:
+            saved_fps = DEFAULT_FPS
+        else:
+            saved_fps = int(raw_fps or DEFAULT_FPS)
+        self._set_fps(max(10, min(60, saved_fps)))
+        saved_speed = clamp_speed_multiplier(self.settings.get("speed_multiplier", DEFAULT_SPEED_MULTIPLIER))
+        self._set_speed_multiplier(saved_speed, save=False)
 
         self.chk_smoke.setChecked(bool(self.settings.get("show_smoke", True)))
         self.chk_unspotted.setChecked(bool(self.settings.get("show_unspotted_names", True)))
@@ -1727,6 +2097,165 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         _open_folder_in_explorer(path)
 
+    # =========================================================================
+    # 关于页：在线检查更新与一键快速拉取更新
+    # =========================================================================
+
+    @staticmethod
+    def _format_bytes_mb(num_bytes: int) -> str:
+        return f"{max(0, int(num_bytes)) / (1024 * 1024):.1f} MB"
+
+    def _on_check_updates(self) -> None:
+        if (self._update_check_worker is not None and self._update_check_worker.isRunning()) or (
+            self._update_dl_worker is not None and self._update_dl_worker.isRunning()
+        ):
+            return
+        self._latest_update_info = None
+        self.update_card.setVisible(True)
+        self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold;")
+        self.lbl_update_status.setText(self._t("upd_checking"))
+        self.update_notes_box.setVisible(False)
+        self.update_progress.setVisible(False)
+        self.lbl_update_prog.setVisible(False)
+        self.btn_pull_update.setVisible(False)
+        self.btn_cancel_update.setVisible(False)
+        self.btn_open_release.setVisible(False)
+        self.btn_check_update.setEnabled(False)
+
+        self._update_check_worker = UpdateCheckWorker(APP_VERSION, parent=self)
+        self._update_check_worker.finished_signal.connect(self._on_update_check_done)
+        self._update_check_worker.start()
+
+    def _on_update_check_done(self, ok: bool, info: Any, err: str) -> None:
+        self._update_check_worker = None
+        self.btn_check_update.setEnabled(True)
+        if not ok or info is None:
+            self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #d94c4c;")
+            self.lbl_update_status.setText(self._t("upd_failed", err=err or "Unknown error"))
+            self.btn_open_release.setVisible(True)
+            self._append_log(f"[Update] Check failed: {err}")
+            return
+
+        self._latest_update_info = info
+        if not info.has_update:
+            self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #16a580;")
+            self.lbl_update_status.setText(self._t("upd_latest", ver=APP_VERSION))
+            self.btn_open_release.setVisible(True)
+            self._append_log(f"[Update] Up to date (v{APP_VERSION}, latest v{info.latest_version}).")
+            return
+
+        self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #16a580;")
+        self.lbl_update_status.setText(self._t("upd_available", latest=info.latest_version, cur=APP_VERSION))
+        if info.notes:
+            self.update_notes_box.setPlainText(info.notes[:1200])
+            self.update_notes_box.setVisible(True)
+        self.btn_open_release.setVisible(True)
+
+        if info.selected_asset is not None and info.update_mode in ("installer", "portable"):
+            self.btn_pull_update.setVisible(True)
+            self.btn_pull_update.setEnabled(True)
+        else:
+            self.lbl_update_prog.setText(self._t("upd_dev_hint"))
+            self.lbl_update_prog.setVisible(True)
+        self._append_log(
+            f"[Update] New version v{info.latest_version} found (mode={info.update_mode}, "
+            f"asset={info.selected_asset.name if info.selected_asset else 'none'})."
+        )
+
+    def _on_pull_update(self) -> None:
+        info = self._latest_update_info
+        if info is None or info.selected_asset is None or info.update_mode not in ("installer", "portable"):
+            self._on_open_release_page()
+            return
+        if self._render_worker is not None and self._render_worker.isRunning():
+            return
+        if self._update_dl_worker is not None and self._update_dl_worker.isRunning():
+            return
+
+        self.btn_check_update.setEnabled(False)
+        self.btn_pull_update.setEnabled(False)
+        self.btn_cancel_update.setVisible(True)
+        self.btn_cancel_update.setEnabled(True)
+        self.update_progress.setValue(0)
+        self.update_progress.setVisible(True)
+        self.lbl_update_prog.setText(self._t("upd_downloading_unknown", done="0.0 MB"))
+        self.lbl_update_prog.setVisible(True)
+
+        self._update_dl_worker = UpdateDownloadWorker(info.selected_asset, info.update_mode, parent=self)
+        self._update_dl_worker.progress_signal.connect(self._on_update_download_progress)
+        self._update_dl_worker.finished_signal.connect(self._on_update_download_done)
+        self._update_dl_worker.start()
+
+    def _on_update_download_progress(self, done_obj: Any, total_obj: Any) -> None:
+        done = int(done_obj or 0)
+        total = int(total_obj or 0)
+        if total > 0:
+            pct = min(100, int(done * 100 / total))
+            self.update_progress.setRange(0, 1000)
+            self.update_progress.setValue(min(1000, int(done * 1000 / total)))
+            self.lbl_update_prog.setText(
+                self._t(
+                    "upd_downloading",
+                    done=self._format_bytes_mb(done),
+                    total=self._format_bytes_mb(total),
+                    pct=pct,
+                )
+            )
+        else:
+            self.update_progress.setRange(0, 0)
+            self.lbl_update_prog.setText(self._t("upd_downloading_unknown", done=self._format_bytes_mb(done)))
+
+    def _on_cancel_update(self) -> None:
+        if self._update_dl_worker is not None and self._update_dl_worker.isRunning():
+            self._update_dl_worker.request_cancel()
+            self.btn_cancel_update.setEnabled(False)
+
+    def _on_update_download_done(self, ok: bool, pkg_path_str: str, err: str, cancelled: bool) -> None:
+        self._update_dl_worker = None
+        self.btn_check_update.setEnabled(True)
+        self.btn_cancel_update.setVisible(False)
+        self.update_progress.setRange(0, 1000)
+
+        if cancelled:
+            self.btn_pull_update.setEnabled(True)
+            self.lbl_update_prog.setText(self._t("upd_cancelled"))
+            return
+
+        if not ok or not pkg_path_str:
+            self.btn_pull_update.setEnabled(True)
+            self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #d94c4c;")
+            self.lbl_update_status.setText(self._t("upd_failed", err=err or "Download failed"))
+            self._append_log(f"[Update] Download failed: {err}")
+            return
+
+        info = self._latest_update_info
+        mode = info.update_mode if info is not None else "portable"
+        self.update_progress.setValue(1000)
+        self.lbl_update_prog.setText(self._t("upd_applying"))
+        QApplication.processEvents()
+        try:
+            from .updater import apply_downloaded_update
+
+            self._save_settings()
+            apply_downloaded_update(Path(pkg_path_str), update_mode=mode, app_dir=PROJECT_ROOT)
+            app = QApplication.instance()
+            self.close()
+            if app is not None:
+                app.quit()
+        except Exception as exc:
+            self.btn_pull_update.setEnabled(True)
+            self.lbl_update_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #d94c4c;")
+            self.lbl_update_status.setText(self._t("upd_failed", err=str(exc)))
+            self._append_log(f"[Update] Apply failed: {exc}")
+
+    def _on_open_release_page(self) -> None:
+        url = (
+            self._latest_update_info.html_url
+            if (self._latest_update_info is not None and getattr(self._latest_update_info, "html_url", ""))
+            else f"{REPO_URL}/releases"
+        )
+        webbrowser.open(url)
+
     def _on_clear_version_cache(self) -> None:
         vers_dir = self.data_dir / "versions"
         if not vers_dir.is_dir():
@@ -1741,48 +2270,63 @@ class MainWindow(QMainWindow):
             return
         shutil.rmtree(vers_dir, ignore_errors=True)
         self._store_cache = None
-        self._live_loc_cache.clear()
+        gc.collect()
         self._append_log("[Cache] Cleared version cache.")
         self._on_client_changed()
 
-    def _set_resolution_controls(self, w: int, h: int) -> None:
-        self._updating_res = True
-        try:
-            self.width_spin.setValue(w)
-            self.height_spin.setValue(h)
-            matched_idx = len(RESOLUTION_PRESET_SPECS) - 1
-            for idx, (_key, pw, ph) in enumerate(RESOLUTION_PRESET_SPECS):
-                if pw == w and ph == h:
-                    matched_idx = idx
-                    break
-            self.res_combo.setCurrentIndex(matched_idx)
-            self.custom_res_row.setVisible(matched_idx == len(RESOLUTION_PRESET_SPECS) - 1)
-        finally:
-            self._updating_res = False
+    def _current_output_size(self) -> tuple[int, int]:
+        idx = self.res_combo.currentIndex()
+        if 0 <= idx < len(RESOLUTION_PRESET_SPECS):
+            _key, pw, ph = RESOLUTION_PRESET_SPECS[idx]
+            return pw, ph
+        return (1920, 1080)
 
-    def _on_res_preset_changed(self, idx: int) -> None:
-        if self._updating_res or idx < 0 or idx >= len(RESOLUTION_PRESET_SPECS):
-            return
-        _key, pw, ph = RESOLUTION_PRESET_SPECS[idx]
-        is_custom = pw == 0 or ph == 0
-        self.custom_res_row.setVisible(is_custom)
-        if not is_custom:
-            self._updating_res = True
-            try:
-                self.width_spin.setValue(pw)
-                self.height_spin.setValue(ph)
-            finally:
-                self._updating_res = False
+    def _set_resolution_controls(self, w: int, h: int) -> None:
+        snapped_w, snapped_h = snap_to_allowed_resolution(w, h)
+        matched_idx = 1  # 默认 1K (1920x1080)
+        for idx, (_key, pw, ph) in enumerate(RESOLUTION_PRESET_SPECS):
+            if pw == snapped_w and ph == snapped_h:
+                matched_idx = idx
+                break
+        self.res_combo.setCurrentIndex(matched_idx)
 
     def _set_fps(self, val: int) -> None:
-        self.fps_spin.setValue(val)
-        self._sync_fps_pills(val)
+        self.fps_spin.setValue(max(10, min(60, int(val))))
+        self._sync_fps_pills(self.fps_spin.value())
 
     def _sync_fps_pills(self, val: int) -> None:
         for pv, btn in self._fps_buttons.items():
             btn.setProperty("active", pv == val)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def _sync_speed_pills(self, mult: float) -> None:
+        for pv, btn in self._speed_buttons.items():
+            btn.setProperty("active", abs(pv - mult) < 0.015)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _set_speed_multiplier(self, val: float, save: bool = False) -> None:
+        clamped = clamp_speed_multiplier(val)
+        self._updating_speed = True
+        try:
+            self.speed_spin.setValue(clamped)
+            self.speed_slider.setValue(int(round(clamped * 100)))
+            self._sync_speed_pills(clamped)
+        finally:
+            self._updating_speed = False
+        if save:
+            self._save_settings()
+
+    def _on_speed_slider_changed(self, raw_int: int) -> None:
+        if self._updating_speed:
+            return
+        self._set_speed_multiplier(raw_int / 100.0, save=True)
+
+    def _on_speed_spin_changed(self, val: float) -> None:
+        if self._updating_speed:
+            return
+        self._set_speed_multiplier(val, save=True)
 
     # =========================================================================
     # 客户端探测、零等待本地化与后台自动同步
@@ -1794,20 +2338,21 @@ class MainWindow(QMainWindow):
             self._store_cache = None
             return
         target = preferred_version if (preferred_version and preferred_version in vers) else vers[0]
+        if self._store_cache is not None and self._store_cache.version == target:
+            return
         try:
-            self._store_cache = load_version_store(target, data_dir=self.data_dir)
+            # GUI 列表仅需舰船与地图名称表（lite=True），省去弹药/消耗品/飞机大表常驻内存
+            self._store_cache = load_version_store(target, data_dir=self.data_dir, lite=True)
         except Exception:
             self._store_cache = None
 
-    def _get_live_localization(self, game_dir: Path) -> LocalizationBundle | None:
-        key = str(game_dir.resolve()).lower() if game_dir.exists() else str(game_dir).lower()
-        if key in self._live_loc_cache:
-            return self._live_loc_cache[key]
+    def _load_transient_localization(self, game_dir: Path) -> Any:
+        """首次未同步时临时读取客户端 .mo 词库，用完即释放，避免 5 万词条常驻内存。"""
+        from .extractor.localization import load_localization
+
         try:
             info = locate_client(game_dir)
-            bundle = load_localization(info)
-            self._live_loc_cache[key] = bundle
-            return bundle
+            return load_localization(info)
         except Exception:
             return None
 
@@ -1921,7 +2466,7 @@ class MainWindow(QMainWindow):
         self.btn_sync_i18n.setEnabled(True)
         self.btn_sync_full.setEnabled(True)
         if ok:
-            self._live_loc_cache.clear()
+            self._store_cache = None
             self._reload_store_cache(preferred_version=version)
             self._sync_status_state = ("ready", version)
             self._refresh_sync_pill_text()
@@ -1930,6 +2475,7 @@ class MainWindow(QMainWindow):
         else:
             self._sync_status_state = ("fail", "")
             self._refresh_sync_pill_text()
+        _trim_process_memory()
 
     def _on_browse_game_dir(self) -> None:
         cur = self._current_game_dir()
@@ -1953,31 +2499,36 @@ class MainWindow(QMainWindow):
 
     def _scan_replays(self) -> None:
         gdir = self._current_game_dir()
-        loc_bundle: LocalizationBundle | None = None
+        loc_bundle: Any = None
         if self._store_cache is None and gdir is not None and gdir.is_dir():
-            loc_bundle = self._get_live_localization(gdir)
+            loc_bundle = self._load_transient_localization(gdir)
 
-        if gdir is None or not gdir.is_dir():
-            self.game_replays = []
-        else:
-            self.game_replays = scan_replays_in_game_dir(
-                gdir, store=self._store_cache, loc_bundle=loc_bundle, lang=self.lang
-            )
-            if not self.game_replays and not (gdir / "replays").is_dir():
-                direct = [
-                    parse_replay_item(p, store=self._store_cache, source="游戏目录", loc_bundle=loc_bundle, lang=self.lang)
-                    for p in gdir.iterdir()
-                    if p.is_file() and p.suffix.lower() == ".korablireplay" and p.name.lower() != "temp.korablireplay"
+        try:
+            if gdir is None or not gdir.is_dir():
+                self.game_replays = []
+            else:
+                self.game_replays = scan_replays_in_game_dir(
+                    gdir, store=self._store_cache, loc_bundle=loc_bundle, lang=self.lang
+                )
+                if not self.game_replays and not (gdir / "replays").is_dir():
+                    direct = [
+                        parse_replay_item(p, store=self._store_cache, source="游戏目录", loc_bundle=loc_bundle, lang=self.lang)
+                        for p in gdir.iterdir()
+                        if p.is_file() and p.suffix.lower() == ".korablireplay" and p.name.lower() != "temp.korablireplay"
+                    ]
+                    direct.sort(key=lambda x: (x.sort_timestamp, x.filename), reverse=True)
+                    self.game_replays = direct
+
+            if self.dropped_replays:
+                self.dropped_replays = [
+                    parse_replay_item(it.path, store=self._store_cache, source="手动拖入", loc_bundle=loc_bundle, lang=self.lang)
+                    for it in self.dropped_replays
+                    if it.path.is_file()
                 ]
-                direct.sort(key=lambda x: (x.sort_timestamp, x.filename), reverse=True)
-                self.game_replays = direct
-
-        if self.dropped_replays:
-            self.dropped_replays = [
-                parse_replay_item(it.path, store=self._store_cache, source="手动拖入", loc_bundle=loc_bundle, lang=self.lang)
-                for it in self.dropped_replays
-                if it.path.is_file()
-            ]
+        finally:
+            if loc_bundle is not None:
+                del loc_bundle
+                gc.collect()
         self._render_list()
 
     def _all_items_merged(self) -> list[ReplayListItem]:
@@ -2087,17 +2638,22 @@ class MainWindow(QMainWindow):
             return
 
         gdir = self._current_game_dir()
-        loc_bundle = self._get_live_localization(gdir) if (self._store_cache is None and gdir and gdir.is_dir()) else None
-        existing = {str(it.path.resolve()).lower() for it in self.dropped_replays if it.path.exists()}
-        for p in valid:
-            key = str(p.resolve()).lower()
-            self.checked_paths.add(key)
-            if key not in existing:
-                self.dropped_replays.insert(
-                    0,
-                    parse_replay_item(p, store=self._store_cache, source="手动拖入", loc_bundle=loc_bundle, lang=self.lang),
-                )
-                existing.add(key)
+        loc_bundle = self._load_transient_localization(gdir) if (self._store_cache is None and gdir and gdir.is_dir()) else None
+        try:
+            existing = {str(it.path.resolve()).lower() for it in self.dropped_replays if it.path.exists()}
+            for p in valid:
+                key = str(p.resolve()).lower()
+                self.checked_paths.add(key)
+                if key not in existing:
+                    self.dropped_replays.insert(
+                        0,
+                        parse_replay_item(p, store=self._store_cache, source="手动拖入", loc_bundle=loc_bundle, lang=self.lang),
+                    )
+                    existing.add(key)
+        finally:
+            if loc_bundle is not None:
+                del loc_bundle
+                gc.collect()
         self.tabs.setCurrentIndex(0)
         self._append_log(f"[Import] Added {len(valid)} .korablireplay file(s).")
         self._render_list()
@@ -2158,10 +2714,11 @@ class MainWindow(QMainWindow):
         for w in (
             self.client_combo, self.btn_browse_game, self.search_edit,
             self.btn_toggle_all, self.btn_import, self.btn_refresh,
-            self.res_combo, self.width_spin, self.height_spin, self.fps_spin,
+            self.res_combo, self.fps_spin, self.speed_slider, self.speed_spin,
             self.btn_rescan_clients, self.btn_sync_i18n, self.btn_sync_full,
             self.lang_combo,
             *self._fps_buttons.values(),
+            *self._speed_buttons.values(),
         ):
             w.setEnabled(not rendering)
         self.btn_render.setVisible(not rendering)
@@ -2182,10 +2739,12 @@ class MainWindow(QMainWindow):
 
         self._save_settings()
         out_root = Path(self.output_dir_edit.text().strip() or str(DEFAULT_OUTPUT_DIR))
+        out_w, out_h = self._current_output_size()
         cfg = RenderConfig(
             fps=self.fps_spin.value(),
-            output_width=self.width_spin.value(),
-            output_height=self.height_spin.value(),
+            speed_multiplier=clamp_speed_multiplier(self.speed_spin.value()),
+            output_width=out_w,
+            output_height=out_h,
             language=self.lang,
             end_banner_seconds=self.banner_sec_spin.value(),
             show_smoke=self.chk_smoke.isChecked(),
@@ -2202,7 +2761,10 @@ class MainWindow(QMainWindow):
         )
         self.progress_bar.setValue(0)
         self.lbl_prog_title.setText(self._t("prog_preparing", n=len(items)))
-        self.lbl_prog_sub.setText(f"{cfg.resolved_output_size()[0]}×{cfg.resolved_output_size()[1]} · {cfg.fps}fps")
+        self.lbl_prog_sub.setText(
+            f"{cfg.resolved_output_size()[0]}×{cfg.resolved_output_size()[1]} · "
+            f"{cfg.fps}fps · {cfg.resolved_speed_multiplier():g}×"
+        )
 
         self._render_worker = BatchRenderWorker(
             items=items,
@@ -2242,9 +2804,11 @@ class MainWindow(QMainWindow):
         if ok_count > 0 and batch_dir.is_dir():
             self.last_batch_dir = batch_dir
 
+        self._render_worker = None
         self._reload_store_cache()
         self._on_client_changed()
         self._set_rendering_state(False)
+        _trim_process_memory()
 
         if cancelled:
             self.lbl_prog_title.setText(self._t("prog_stopped", ok=ok_count))
@@ -2276,10 +2840,16 @@ def launch_gui(
     theme: str | None = None,
 ) -> int:
     """启动四标签页多语言 PySide6 桌面图形界面。"""
+    _set_win32_app_user_model_id()
+
     app = QApplication.instance()
     created_app = app is None
     if app is None:
         app = QApplication(sys.argv)
+
+    icon_path = _resolve_app_icon_path()
+    app_icon = _build_app_icon(icon_path)
+    app.setWindowIcon(app_icon)
 
     is_shot = screenshot_path is not None or screenshot_all_tabs_dir is not None
     win = MainWindow(
@@ -2288,7 +2858,10 @@ def launch_gui(
         lang_override=lang,
         theme_override=theme,
     )
+    win.setWindowIcon(app_icon)
     win.show()
+    if not is_shot:
+        QTimer.singleShot(900, _trim_process_memory)
 
     if is_shot:
         def _capture_and_quit() -> None:
